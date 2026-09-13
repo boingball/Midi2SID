@@ -22,6 +22,7 @@ Useful options:
 python3 midi2sid.py song.mid song.prg --title "MY SONG" --drums smart --video pal
 python3 midi2sid.py song.mid song.prg --drums off --video ntsc
 python3 midi2sid.py song.mid song.prg --filter auto
+python3 midi2sid.py song.mid song.prg --feel expressive
 ```
 
 Load the resulting program in VICE, another C64 emulator, a flash cartridge,
@@ -41,6 +42,14 @@ or real hardware, then type `RUN`. The program supplies its own BASIC launcher,
 The shared filter is off by default because rapid 6581 filter-route changes can
 click and filter calibration varies between chips. `--filter auto` enables the
 more aggressive patch filter treatment.
+
+The default `--feel tight` mode gives every selected MIDI note a real SID gate
+retrigger, writes ADSR before raising the gate, uses immediate attacks and keeps
+drum voice-stealing short. It also holds each patch's pulse width steady instead
+of restarting PWM on every short note. This is intended for rhythmically precise
+automatic conversions. `--feel expressive` restores animated PWM and the slower
+family-specific attack/release values for files arranged around sustained pads
+and strings.
 
 The generated player starts in safe visual mode 1 with a black border. During
 playback, keys 1-5 select: safe/static, voice lights, slow border, both, and a

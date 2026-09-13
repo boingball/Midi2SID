@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 import math
 
@@ -28,6 +29,15 @@ class Note:
     velocity: int
     channel: int
     program: int
+
+
+class SidFrame(bytes):
+    """A SID register snapshot plus voices that need an ADSR retrigger."""
+
+    def __new__(cls, registers: bytes | bytearray | list[int], retrigger_mask: int = 0):
+        frame = super().__new__(cls, bytes(registers))
+        frame.retrigger_mask = retrigger_mask & 0x07
+        return frame
 
 
 @dataclass(frozen=True)
@@ -200,21 +210,45 @@ def _choose_voices(
     elif middle_pitches:
         middle_pitch = middle_pitches[-1]
     else:
-        middle_pitch = lead_pitch
-    return [by_pitch[lead_pitch], by_pitch[middle_pitch], by_pitch[bass_pitch]], lead_pitch, middle_pitch
+        middle_pitch = None
+
+    # Never duplicate one MIDI note across SID oscillators. Apart from making
+    # sparse passages needlessly loud, tiny phase differences turn duplicated
+    # pulse/triangle notes into clicks and a ragged chorus. With two pitches we
+    # keep lead and bass; the middle voice is only used for a genuinely distinct
+    # note.
+    bass = by_pitch[bass_pitch] if bass_pitch != lead_pitch else None
+    middle = by_pitch[middle_pitch] if middle_pitch is not None else None
+    return [by_pitch[lead_pitch], middle, bass], lead_pitch, middle_pitch
 
 
-def _patch_registers(note: Note, age: int, voice: int, clock: int) -> list[int]:
+def _patch_registers(
+    note: Note, age: int, voice: int, clock: int, feel: str = "tight",
+) -> list[int]:
     patch = PATCHES[family(note.program)]
     cents = 0.0
     if patch.vibrato and age >= patch.vibrato_delay:
         cents = patch.vibrato * LFO[((age - patch.vibrato_delay) // patch.vibrato_step) % len(LFO)]
     frequency = sid_frequency(note.pitch + cents / 100.0, clock)
     pulse = patch.pulse
-    if patch.pwm_depth:
+    if patch.pwm_depth and feel == "expressive":
         pulse += round(patch.pwm_depth * LFO[(age // patch.pwm_step) % len(LFO)])
     pulse = max(0x080, min(0xf80, pulse))
-    velocity_sustain = max(1, min(15, round(patch.sustain * note.velocity / 127)))
+    if feel == "tight":
+        # Most automatically arranged notes last only a few video frames. Slow
+        # SID attacks make them arrive perceptibly behind the MIDI beat, so the
+        # default mode uses the chip's fastest attack and a short release while
+        # retaining each patch's waveform, pulse colour, decay, sustain and
+        # vibrato. Animated PWM remains available in expressive mode: restarting
+        # it on every short note makes dense automatic reductions sound untidy.
+        attack = 0
+        release = min(patch.release, 2)
+        velocity_scale = 0.65 + 0.35 * note.velocity / 127
+    else:
+        attack = patch.attack
+        release = patch.release
+        velocity_scale = note.velocity / 127
+    velocity_sustain = max(1, min(15, round(patch.sustain * velocity_scale)))
     control = patch.waveform | GATE
     if patch.ring and voice:
         control |= RING
@@ -224,8 +258,8 @@ def _patch_registers(note: Note, age: int, voice: int, clock: int) -> list[int]:
         frequency & 0xff, frequency >> 8,
         pulse & 0xff, (pulse >> 8) & 0x0f,
         control,
-        (patch.attack << 4) | patch.decay,
-        (velocity_sustain << 4) | patch.release,
+        (attack << 4) | patch.decay,
+        (velocity_sustain << 4) | release,
     ]
 
 
@@ -258,6 +292,17 @@ def _drum_registers(note: Note, age: int, clock: int) -> list[int]:
     ]
 
 
+def _drum_tail(pitch: int) -> int:
+    """Return a short, bass-friendly percussion lifetime in video frames."""
+    if pitch in (42, 44, 46, 54, 69, 70):       # hats, tambourine, shakers
+        return 1
+    if pitch in (49, 51, 52, 55, 57, 59):       # cymbals
+        return 3
+    if pitch in (41, 43, 45, 47, 48, 50):       # toms
+        return 3
+    return 2                                    # kick, snare and other hits
+
+
 def _first_tempo(tempos: list[tuple[int, int]]) -> int:
     at_zero = [value for tick, value in tempos if tick == 0]
     return at_zero[-1] if at_zero else (tempos[0][1] if tempos else 500_000)
@@ -266,6 +311,7 @@ def _first_tempo(tempos: list[tuple[int, int]]) -> int:
 def frames_for(
     notes: list[Note], division: int, tempos: list[tuple[int, int]] | None = None,
     drums: str = "smart", video: str = "pal", filter_mode: str = "off",
+    feel: str = "tight",
 ) -> list[bytes]:
     """Render complete 25-register SID snapshots at the target video rate."""
     if drums not in ("off", "smart"):
@@ -274,17 +320,32 @@ def frames_for(
         raise ValueError("video must be pal or ntsc")
     if filter_mode not in ("off", "auto"):
         raise ValueError("filter mode must be off or auto")
+    if feel not in ("tight", "expressive"):
+        raise ValueError("feel must be tight or expressive")
     tempo = _first_tempo(tempos or [])
     rate = 50 if video == "pal" else 60
     clock = PAL_SID_CLOCK if video == "pal" else NTSC_SID_CLOCK
-    step = max(1, round(division * 1_000_000 / (tempo * rate)))
-    total = max(1, math.ceil((max(note.end for note in notes) + step) / step))
+    ticks_per_frame = Fraction(division * 1_000_000, tempo * rate)
+    tick_numerator = ticks_per_frame.numerator
+    tick_denominator = ticks_per_frame.denominator
+    last_tick = max(note.end for note in notes)
+    total = max(1, math.ceil(last_tick * tick_denominator / tick_numerator) + 1)
     frames: list[bytes] = []
     previous_lead = previous_middle = None
+    previous_sources: list[tuple | None] = [None, None, None]
 
     for frame in range(total):
-        start, end = frame * step, (frame + 1) * step
-        live_tones = [n for n in notes if n.channel != 9 and n.start < end and n.end > start]
+        # Keep the MIDI clock fractional. Rounding 5.28 ticks/frame to 5 made
+        # the Popcorn test file 5.6% slow and lets the error accumulate over a
+        # song. Integer cross-products avoid floating-point boundary wobble.
+        start_tick_scaled = frame * tick_numerator
+        end_tick_scaled = (frame + 1) * tick_numerator
+        live_tones = [
+            n for n in notes
+            if n.channel != 9
+            and n.start * tick_denominator < end_tick_scaled
+            and n.end * tick_denominator > start_tick_scaled
+        ]
         voices, previous_lead, previous_middle = _choose_voices(
             live_tones, previous_lead, previous_middle
         )
@@ -294,22 +355,32 @@ def frames_for(
         for voice, note in enumerate(voices):
             if note is None:
                 continue
-            age = max(0, (start - note.start) // step)
-            registers[voice * 7:voice * 7 + 7] = _patch_registers(note, age, voice, clock)
+            onset_frame = note.start * tick_denominator // tick_numerator
+            age = max(0, frame - onset_frame)
+            registers[voice * 7:voice * 7 + 7] = _patch_registers(
+                note, age, voice, clock, feel=feel
+            )
+
+        sources: list[tuple | None] = [
+            ("tone", note.start, note.end, note.pitch, note.channel, note.program)
+            if note is not None else None
+            for note in voices
+        ]
 
         if drums != "off":
             candidates = []
             for note in notes:
                 if note.channel != 9:
                     continue
-                onset = note.start // step
+                onset = note.start * tick_denominator // tick_numerator
                 age = frame - onset
-                tail = 2 if note.pitch in (42, 44, 54, 69, 70) else 6
+                tail = _drum_tail(note.pitch)
                 if 0 <= age < tail:
                     candidates.append((note, age))
             if candidates:
                 drum, age = max(candidates, key=lambda item: (DRUM_PRIORITY.get(item[0].pitch, 50), item[0].velocity))
                 registers[14:21] = _drum_registers(drum, age, clock)
+                sources[2] = ("drum", drum.start, drum.pitch, drum.channel)
 
         # Use the lead patch to drive the shared filter and route voice one.
         lead = voices[0]
@@ -325,13 +396,21 @@ def frames_for(
                 registers[24] = 15
         else:
             registers[24] = 15
-        frames.append(bytes(registers))
+        retrigger_mask = 0
+        for voice, source in enumerate(sources):
+            if source is not None and previous_sources[voice] is not None and source != previous_sources[voice]:
+                retrigger_mask |= 1 << voice
+        frames.append(SidFrame(registers, retrigger_mask))
+        previous_sources = sources
     return frames
 
 
 def compile_sid_frames(
     midi_path: str | Path, video: str = "pal", drums: str = "smart",
-    filter_mode: str = "off",
+    filter_mode: str = "off", feel: str = "tight",
 ) -> list[bytes]:
     division, notes, tempos = read_midi(midi_path)
-    return frames_for(notes, division, tempos, drums=drums, video=video, filter_mode=filter_mode)
+    return frames_for(
+        notes, division, tempos, drums=drums, video=video,
+        filter_mode=filter_mode, feel=feel,
+    )

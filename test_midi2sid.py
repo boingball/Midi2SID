@@ -32,6 +32,51 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertEqual(voices[0].pitch, 72)
         self.assertEqual(voices[2].pitch, 36)
 
+    def test_sparse_chords_do_not_duplicate_sid_voices(self):
+        one = [sid_midi.Note(0, 100, 60, 100, 0, 0)]
+        two = one + [sid_midi.Note(0, 100, 72, 100, 0, 80)]
+        one_voices, _, _ = sid_midi._choose_voices(one)
+        two_voices, _, _ = sid_midi._choose_voices(two)
+        self.assertEqual([note.pitch if note else None for note in one_voices], [60, None, None])
+        self.assertEqual([note.pitch if note else None for note in two_voices], [72, None, 60])
+
+    def test_tight_feel_uses_fast_attack_and_velocity_floor(self):
+        note = sid_midi.Note(0, 96, 60, 1, 0, 48)
+        tight = sid_midi.frames_for([note], 96, feel="tight")[0]
+        expressive = sid_midi.frames_for([note], 96, feel="expressive")[0]
+        self.assertEqual(tight[5] >> 4, 0)
+        self.assertEqual(expressive[5] >> 4, sid_midi.PATCHES["ensemble"].attack)
+        self.assertGreater(tight[6] >> 4, expressive[6] >> 4)
+
+    def test_tight_feel_keeps_pulse_width_stable(self):
+        note = sid_midi.Note(0, 960, 60, 100, 0, 0)
+        tight = sid_midi._patch_registers(note, 4, 0, sid_midi.PAL_SID_CLOCK, "tight")
+        expressive = sid_midi._patch_registers(note, 4, 0, sid_midi.PAL_SID_CLOCK, "expressive")
+        self.assertEqual(tight[2:4], [0x80, 0x06])
+        self.assertNotEqual(tight[2:4], expressive[2:4])
+
+    def test_new_same_waveform_note_sets_retrigger_mask(self):
+        notes = [
+            sid_midi.Note(0, 96, 60, 100, 0, 0),
+            sid_midi.Note(96, 192, 62, 100, 0, 0),
+        ]
+        frames = sid_midi.frames_for(notes, 96)
+        changed = [frame for frame in frames if frame.retrigger_mask]
+        self.assertTrue(changed)
+        self.assertTrue(changed[0].retrigger_mask & 1)
+
+    def test_smart_drums_have_short_voice_stealing(self):
+        self.assertEqual(sid_midi._drum_tail(42), 1)
+        self.assertEqual(sid_midi._drum_tail(38), 2)
+        self.assertEqual(sid_midi._drum_tail(51), 3)
+
+    def test_fractional_midi_clock_does_not_accumulate_tempo_error(self):
+        # 120 PPQN at 132 BPM is 5.28 ticks per PAL frame. A rounded five-tick
+        # clock would produce 25 frames instead of the correct 24 here.
+        note = sid_midi.Note(0, 120, 60, 100, 0, 0)
+        frames = sid_midi.frames_for([note], 120, tempos=[(0, 454545)])
+        self.assertEqual(len(frames), 24)
+
     def test_drum_steals_voice_three_and_uses_noise(self):
         notes = [
             sid_midi.Note(0, 96, 60, 100, 0, 0),
@@ -77,7 +122,15 @@ class PrgTests(unittest.TestCase):
         old = bytearray(25); old[4] = sid_midi.PULSE | sid_midi.GATE; old[24] = 15
         new = bytearray(old); new[4] = sid_midi.NOISE | sid_midi.GATE
         events = build_prg.encode_events([bytes(old), bytes(new)])
-        marker = bytes((4, sid_midi.PULSE, 4, sid_midi.NOISE | sid_midi.GATE))
+        marker = bytes((build_prg.EVENT_RETRIGGER_BASE | 1, 4, sid_midi.NOISE | sid_midi.GATE))
+        self.assertIn(marker, events)
+
+    def test_retrigger_writes_adsr_before_gate_on(self):
+        first = bytearray(25); first[4] = sid_midi.PULSE | sid_midi.GATE; first[5] = 1; first[24] = 15
+        second = bytearray(first); second[0] = 2; second[5] = 8
+        frame = sid_midi.SidFrame(second, retrigger_mask=1)
+        events = build_prg.encode_events([bytes(first), frame])
+        marker = bytes((build_prg.EVENT_RETRIGGER_BASE | 1, 0, 2, 5, 8, 4, sid_midi.PULSE | sid_midi.GATE))
         self.assertIn(marker, events)
 
     def test_prg_has_load_address_and_basic_sys_stub(self):

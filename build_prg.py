@@ -9,6 +9,10 @@ ENTRY_ADDRESS = 0x080d
 EVENT_DELAY = 0xfd
 EVENT_FRAME = 0xfe
 EVENT_END = 0xff
+# $f1-$f7 encode a gate-off mask for SID voices 1-3. The player keeps parsing
+# the same video frame, so updated frequency/ADSR registers and gate-on writes
+# follow without adding a 20 ms silent frame.
+EVENT_RETRIGGER_BASE = 0xf0
 MAX_END_ADDRESS = 0xcfff
 
 
@@ -83,20 +87,37 @@ def encode_events(frames: list[bytes]) -> bytes:
     for frame in frames:
         if len(frame) != 25:
             raise ValueError("every SID frame must contain exactly 25 registers")
+        retrigger_mask = getattr(frame, "retrigger_mask", 0)
         changes = [(register, value) for register, value in enumerate(frame) if value != previous[register]]
-        if not changes:
+        if not changes and not retrigger_mask:
             delay += 1
             continue
         flush_delay()
-        # Switching directly between gated waveforms produces a hard edge,
-        # particularly when voice three changes from a noise drum back to a
-        # bass waveform. Release GATE before programming the new voice.
-        for control in (4, 11, 18):
+        controls = (4, 11, 18)
+        # Release GATE before changing waveform or retriggering a new note. The
+        # SID starts an ADSR envelope only on a 0->1 gate transition.
+        forced_controls: set[int] = set()
+        gate_off_mask = 0
+        for voice, control in enumerate(controls):
             old, new = previous[control], frame[control]
-            if old & 1 and new & 1 and (old & 0xf0) != (new & 0xf0):
-                output.extend((control, old & 0xfe))
+            retrigger = bool(retrigger_mask & (1 << voice))
+            if old & 1 and new & 1 and (retrigger or (old & 0xf0) != (new & 0xf0)):
+                gate_off_mask |= 1 << voice
+                forced_controls.add(control)
+        if gate_off_mask:
+            output.append(EVENT_RETRIGGER_BASE | gate_off_mask)
+        # Frequency, pulse width and ADSR must be ready before GATE rises. The
+        # old encoder wrote registers numerically, which put control/GATE ahead
+        # of ADSR and let a new note begin with the previous patch's envelope.
         for register, value in changes:
-            output.extend((register, value))
+            if register not in controls:
+                output.extend((register, value))
+        for register, value in changes:
+            if register in controls:
+                output.extend((register, value))
+        for control in sorted(forced_controls):
+            if all(register != control for register, _ in changes):
+                output.extend((control, frame[control]))
         output.append(EVENT_FRAME)
         previous = frame
     flush_delay()
@@ -121,6 +142,11 @@ def decode_events(events: bytes, frame_limit: int = 1_000_000) -> list[bytes]:
             count = events[position]
             position += 1
             frames.extend([bytes(registers)] * count)
+        elif EVENT_RETRIGGER_BASE < command < EVENT_DELAY:
+            # Retriggers are transient writes within a video frame; the final
+            # decoded snapshot still has the gate raised by the later control
+            # register write.
+            continue
         elif command < 25:
             registers[command] = events[position]
             position += 1
@@ -281,12 +307,26 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.imm(0xc9, EVENT_END); assembler.branch(0xf0, "restart")
     assembler.imm(0xc9, EVENT_FRAME); assembler.branch(0xf0, "return")
     assembler.imm(0xc9, EVENT_DELAY); assembler.branch(0xf0, "set_delay")
+    assembler.imm(0xc9, EVENT_RETRIGGER_BASE + 1); assembler.branch(0x90, "register_write")
+    assembler.imm(0xc9, EVENT_DELAY); assembler.branch(0x90, "retrigger")
+    assembler.label("register_write")
     # The streaming decompressor uses X for its ring buffer, so retain the
     # target SID register in zero page while fetching the value byte.
     assembler.zp(0x85, zp_register)
     assembler.absolute(0x20, "getbyte")
     assembler.zp(0xa6, zp_register)
     assembler.absolute(0x9d, 0xd400)
+    assembler.absolute(0x4c, "parse")
+    assembler.label("retrigger")
+    assembler.zp(0x85, zp_register)
+    for bit, control, done in (
+        (1, 0xd404, "retrigger2"),
+        (2, 0xd40b, "retrigger3"),
+        (4, 0xd412, "retrigger_done"),
+    ):
+        assembler.zp(0xa5, zp_register); assembler.imm(0x29, bit); assembler.branch(0xf0, done)
+        assembler.absolute(0xad, control); assembler.imm(0x29, 0xfe); assembler.absolute(0x8d, control)
+        assembler.label(done)
     assembler.absolute(0x4c, "parse")
     assembler.label("set_delay")
     assembler.absolute(0x20, "getbyte"); assembler.byte(0x38); assembler.imm(0xe9, 1)
