@@ -40,6 +40,12 @@ class SidSynthesisTests(unittest.TestCase):
         frame = sid_midi.frames_for(notes, 96, drums="smart")[0]
         self.assertTrue(frame[18] & sid_midi.NOISE)
         self.assertTrue(frame[18] & sid_midi.GATE)
+        self.assertEqual(frame[20] >> 4, 0)
+
+    def test_filter_is_off_by_default(self):
+        note = sid_midi.Note(0, 96, 60, 100, 0, 32)
+        frames = sid_midi.frames_for([note], 96)
+        self.assertTrue(all(frame[21:24] == bytes(3) and frame[24] == 15 for frame in frames))
 
     def test_format_one_programs_do_not_leak_between_tracks(self):
         header = b"MThd" + (6).to_bytes(4, "big") + b"\x00\x01\x00\x02\x00\x60"
@@ -66,6 +72,13 @@ class PrgTests(unittest.TestCase):
         packed = build_prg.pack_lzss(source)
         self.assertEqual(build_prg.unpack_lzss(packed), source)
         self.assertLess(len(packed), len(source))
+
+    def test_waveform_change_is_preceded_by_gate_off(self):
+        old = bytearray(25); old[4] = sid_midi.PULSE | sid_midi.GATE; old[24] = 15
+        new = bytearray(old); new[4] = sid_midi.NOISE | sid_midi.GATE
+        events = build_prg.encode_events([bytes(old), bytes(new)])
+        marker = bytes((4, sid_midi.PULSE, 4, sid_midi.NOISE | sid_midi.GATE))
+        self.assertIn(marker, events)
 
     def test_prg_has_load_address_and_basic_sys_stub(self):
         frame = bytes([0] * 24 + [15])

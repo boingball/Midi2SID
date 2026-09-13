@@ -61,12 +61,12 @@ PATCHES = {
     "brass":      Patch(SAW, 1, 4, 11, 5, filter_cutoff=950, resonance=10),
     "reed":       Patch(PULSE, 2, 5, 10, 5, 0x420, vibrato=9, pwm_depth=0x100, filter_cutoff=1450, resonance=4),
     "pipe":       Patch(TRIANGLE, 2, 3, 12, 5, vibrato=11),
-    "lead":       Patch(PULSE | SAW, 0, 3, 12, 4, 0x800, vibrato=12, pwm_depth=0x180, filter_cutoff=1500, resonance=7, sync=True),
+    "lead":       Patch(PULSE, 0, 3, 12, 4, 0x800, vibrato=12, pwm_depth=0x180, filter_cutoff=1500, resonance=7, sync=True),
     "pad":        Patch(PULSE, 9, 4, 9, 10, 0x900, vibrato=7, pwm_depth=0x300, filter_cutoff=850, resonance=8),
     "effects":    Patch(SAW, 1, 7, 7, 8, vibrato=28, filter_cutoff=1200, resonance=12, ring=True),
     "ethnic":     Patch(TRIANGLE, 0, 7, 5, 5, vibrato=6, ring=True),
     "percussive": Patch(NOISE, 0, 5, 2, 3),
-    "sfx":        Patch(PULSE | SAW, 0, 5, 7, 8, 0x800, vibrato=35, pwm_depth=0x300, filter_cutoff=1000, resonance=13, sync=True),
+    "sfx":        Patch(SAW, 0, 5, 7, 8, 0x800, vibrato=35, pwm_depth=0x300, filter_cutoff=1000, resonance=13, sync=True),
 }
 
 LFO = (0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, -0.5)
@@ -247,12 +247,14 @@ def _drum_registers(note: Note, age: int, clock: int) -> list[int]:
         waveform, musical_pitch = NOISE, max(24, min(96, pitch + 18))
         decay = 2 if pitch in (42, 44, 54, 69, 70) else 6
     frequency = sid_frequency(musical_pitch, clock)
-    sustain = max(1, min(15, round(15 * note.velocity / 127)))
+    # A high sustain level makes short noise hits stick at full volume until
+    # GATE drops, which is heard as loud clicks or bursts of continuous noise.
+    # SID percussion is a one-shot decay, so its sustain level is always zero.
     return [
         frequency & 0xff, frequency >> 8, 0, 8,
         waveform | GATE,
         decay,
-        (sustain << 4) | 2,
+        2,
     ]
 
 
@@ -263,13 +265,15 @@ def _first_tempo(tempos: list[tuple[int, int]]) -> int:
 
 def frames_for(
     notes: list[Note], division: int, tempos: list[tuple[int, int]] | None = None,
-    drums: str = "smart", video: str = "pal",
+    drums: str = "smart", video: str = "pal", filter_mode: str = "off",
 ) -> list[bytes]:
     """Render complete 25-register SID snapshots at the target video rate."""
     if drums not in ("off", "smart"):
         raise ValueError("drums must be off or smart")
     if video not in ("pal", "ntsc"):
         raise ValueError("video must be pal or ntsc")
+    if filter_mode not in ("off", "auto"):
+        raise ValueError("filter mode must be off or auto")
     tempo = _first_tempo(tempos or [])
     rate = 50 if video == "pal" else 60
     clock = PAL_SID_CLOCK if video == "pal" else NTSC_SID_CLOCK
@@ -309,7 +313,7 @@ def frames_for(
 
         # Use the lead patch to drive the shared filter and route voice one.
         lead = voices[0]
-        if lead is not None:
+        if filter_mode == "auto" and lead is not None:
             patch = PATCHES[family(lead.program)]
             if patch.filter_cutoff:
                 cutoff = patch.filter_cutoff
@@ -327,6 +331,7 @@ def frames_for(
 
 def compile_sid_frames(
     midi_path: str | Path, video: str = "pal", drums: str = "smart",
+    filter_mode: str = "off",
 ) -> list[bytes]:
     division, notes, tempos = read_midi(midi_path)
-    return frames_for(notes, division, tempos, drums=drums, video=video)
+    return frames_for(notes, division, tempos, drums=drums, video=video, filter_mode=filter_mode)

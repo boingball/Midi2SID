@@ -21,6 +21,7 @@ Useful options:
 ```sh
 python3 midi2sid.py song.mid song.prg --title "MY SONG" --drums smart --video pal
 python3 midi2sid.py song.mid song.prg --drums off --video ntsc
+python3 midi2sid.py song.mid song.prg --filter auto
 ```
 
 Load the resulting program in VICE, another C64 emulator, a flash cartridge,
@@ -36,6 +37,14 @@ or real hardware, then type `RUN`. The program supplies its own BASIC launcher,
 - vibrato, ring modulation and oscillator sync
 - shared resonant filter routing
 - tonal kick/tom sweeps and noise percussion
+
+The shared filter is off by default because rapid 6581 filter-route changes can
+click and filter calibration varies between chips. `--filter auto` enables the
+more aggressive patch filter treatment.
+
+The generated player starts in safe visual mode 1 with a black border. During
+playback, keys 1-5 select: safe/static, voice lights, slow border, both, and a
+slow demo colour mode. No mode changes colour faster than about 3 Hz.
 
 This is an automatic chip-music arrangement, not a transparent reproduction of
 the source MIDI. Dense chords must be reduced to three voices, and drums borrow

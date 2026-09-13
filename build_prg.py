@@ -88,6 +88,13 @@ def encode_events(frames: list[bytes]) -> bytes:
             delay += 1
             continue
         flush_delay()
+        # Switching directly between gated waveforms produces a hard edge,
+        # particularly when voice three changes from a noise drum back to a
+        # bass waveform. Release GATE before programming the new voice.
+        for control in (4, 11, 18):
+            old, new = previous[control], frame[control]
+            if old & 1 and new & 1 and (old & 0xf0) != (new & 0xf0):
+                output.extend((control, old & 0xfe))
         for register, value in changes:
             output.extend((register, value))
         output.append(EVENT_FRAME)
@@ -203,6 +210,7 @@ def _basic_stub() -> bytes:
 
 def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler = Assembler(ENTRY_ADDRESS)
+    zp_colour, zp_frame, zp_mode = 0xf2, 0xf3, 0xf4
     zp_register, zp_ring = 0xf5, 0xf6
     zp_flags, zp_bits = 0xf7, 0xf8
     zp_copy_len, zp_copy_pos = 0xf9, 0xfa
@@ -224,7 +232,11 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
         assembler.absolute(0x9d, address)
     assembler.byte(0xe8); assembler.branch(0xd0, "clear_colour")
 
-    for label, address in (("logo", 0x048c), ("title", 0x0500), ("info", 0x05a0)):
+    for label, address in (
+        ("logo", 0x0488), ("title", 0x0501),
+        ("voice1", 0x05e2), ("voice2", 0x05f0), ("voice3", 0x05fe),
+        ("keys1", 0x06d1), ("keys2", 0x06f9),
+    ):
         assembler.imm(0xa2, 0)
         assembler.label(f"copy_{label}")
         assembler.absolute(0xbd, label)
@@ -240,8 +252,12 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.byte(0xca); assembler.branch(0x10, "clear_sid")
     assembler.imm(0xa9, 15); assembler.absolute(0x8d, 0xd418)
     assembler.imm(0xa9, 0)
-    for address in (zp_ring, zp_flags, zp_bits, zp_copy_len, zp_copy_pos, zp_wait):
+    for address in (zp_colour, zp_frame, zp_ring, zp_flags, zp_bits, zp_copy_len, zp_copy_pos, zp_wait):
         assembler.zp(0x85, address)
+    assembler.imm(0xa9, 1); assembler.zp(0x85, zp_mode)
+    # CIA 1 port A selects keyboard rows; port B reads columns.
+    assembler.imm(0xa9, 0xff); assembler.absolute(0x8d, 0xdc02)
+    assembler.imm(0xa9, 0x00); assembler.absolute(0x8d, 0xdc03)
     # Event pointer immediates are patched after labels resolve.
     data_lo_at = len(assembler.code) + 1
     assembler.imm(0xa9, 0); assembler.zp(0x85, zp_lo)
@@ -329,15 +345,68 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.zp(0xe6, zp_hi)
     assembler.label("gotbyte"); assembler.byte(0x60)
 
-    assembler.label("visual")
-    for control, cell in ((0xd404, 0x06cc), (0xd40b, 0x06f4), (0xd412, 0x071c)):
+    assembler.label("scan_keys")
+    # C64 matrix: 1/2 on row 7, 3/4 on row 1, and 5 on row 2.
+    assembler.imm(0xa9, 0x7f); assembler.absolute(0x8d, 0xdc00)
+    assembler.absolute(0xad, 0xdc01); assembler.imm(0x29, 0x01); assembler.branch(0xd0, "key2")
+    assembler.imm(0xa9, 1); assembler.zp(0x85, zp_mode); assembler.absolute(0x4c, "keys_done")
+    assembler.label("key2")
+    assembler.absolute(0xad, 0xdc01); assembler.imm(0x29, 0x08); assembler.branch(0xd0, "row1")
+    assembler.imm(0xa9, 2); assembler.zp(0x85, zp_mode); assembler.absolute(0x4c, "keys_done")
+    assembler.label("row1")
+    assembler.imm(0xa9, 0xfd); assembler.absolute(0x8d, 0xdc00)
+    assembler.absolute(0xad, 0xdc01); assembler.imm(0x29, 0x01); assembler.branch(0xd0, "key4")
+    assembler.imm(0xa9, 3); assembler.zp(0x85, zp_mode); assembler.absolute(0x4c, "keys_done")
+    assembler.label("key4")
+    assembler.absolute(0xad, 0xdc01); assembler.imm(0x29, 0x08); assembler.branch(0xd0, "row2")
+    assembler.imm(0xa9, 4); assembler.zp(0x85, zp_mode); assembler.absolute(0x4c, "keys_done")
+    assembler.label("row2")
+    assembler.imm(0xa9, 0xfb); assembler.absolute(0x8d, 0xdc00)
+    assembler.absolute(0xad, 0xdc01); assembler.imm(0x29, 0x01); assembler.branch(0xd0, "keys_done")
+    assembler.imm(0xa9, 5); assembler.zp(0x85, zp_mode)
+    assembler.label("keys_done")
+    assembler.imm(0xa9, 0xff); assembler.absolute(0x8d, 0xdc00); assembler.byte(0x60)
+
+    assembler.label("draw_lights")
+    for control, cell in ((0xd404, 0x0635), (0xd40b, 0x0643), (0xd412, 0x0651)):
         assembler.absolute(0xad, control); assembler.imm(0x29, 1)
         assembler.branch(0xf0, f"off_{cell:04x}")
         assembler.imm(0xa9, 0xa0); assembler.branch(0xd0, f"draw_{cell:04x}")
         assembler.label(f"off_{cell:04x}"); assembler.imm(0xa9, 32)
         assembler.label(f"draw_{cell:04x}"); assembler.absolute(0x8d, cell)
-    assembler.absolute(0xad, 0xd401); assembler.imm(0x29, 15); assembler.absolute(0x8d, 0xd020)
     assembler.byte(0x60)
+
+    assembler.label("blank_lights")
+    assembler.imm(0xa9, 32)
+    for cell in (0x0635, 0x0643, 0x0651):
+        assembler.absolute(0x8d, cell)
+    assembler.byte(0x60)
+
+    assembler.label("slow_colour")
+    assembler.zp(0xa5, zp_frame); assembler.imm(0x29, 0x0f); assembler.branch(0xd0, "slow_done")
+    assembler.zp(0xe6, zp_colour); assembler.zp(0xa5, zp_colour); assembler.imm(0x29, 0x0f)
+    assembler.absolute(0x8d, 0xd020)
+    assembler.label("slow_done"); assembler.byte(0x60)
+
+    assembler.label("visual")
+    assembler.absolute(0x20, "scan_keys"); assembler.zp(0xe6, zp_frame)
+    assembler.zp(0xa5, zp_mode); assembler.imm(0xc9, 1); assembler.branch(0xf0, "mode_safe")
+    assembler.imm(0xc9, 2); assembler.branch(0xf0, "mode_lights")
+    assembler.imm(0xc9, 3); assembler.branch(0xf0, "mode_border")
+    assembler.imm(0xc9, 4); assembler.branch(0xf0, "mode_both")
+    # Mode 5 remains deliberately slow: colour changes at roughly 3 Hz PAL.
+    assembler.absolute(0x20, "draw_lights"); assembler.absolute(0x20, "slow_colour")
+    assembler.zp(0xa5, zp_colour); assembler.imm(0x29, 7); assembler.absolute(0x8d, 0xd021); assembler.byte(0x60)
+    assembler.label("mode_safe")
+    assembler.imm(0xa9, 0); assembler.absolute(0x8d, 0xd020); assembler.absolute(0x8d, 0xd021)
+    assembler.absolute(0x20, "blank_lights"); assembler.byte(0x60)
+    assembler.label("mode_lights")
+    assembler.imm(0xa9, 0); assembler.absolute(0x8d, 0xd020); assembler.absolute(0x8d, 0xd021)
+    assembler.absolute(0x4c, "draw_lights")
+    assembler.label("mode_border")
+    assembler.absolute(0x20, "blank_lights"); assembler.absolute(0x4c, "slow_colour")
+    assembler.label("mode_both")
+    assembler.absolute(0x20, "draw_lights"); assembler.absolute(0x4c, "slow_colour")
 
     def add_text(label: str, value: str) -> None:
         assembler.label(label)
@@ -346,7 +415,11 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     add_text("logo", "MIDI2SID")
     clean_title = " ".join(title.upper().replace("_", " ").split())[:38] or "UNTITLED"
     add_text("title", clean_title)
-    add_text("info", "VOICE 1            VOICE 2            VOICE 3")
+    add_text("voice1", "VOICE 1")
+    add_text("voice2", "VOICE 2")
+    add_text("voice3", "VOICE 3")
+    add_text("keys1", "1 SAFE  2 LIGHTS  3 BORDER")
+    add_text("keys2", "4 BOTH  5 DEMO")
     assembler.label("events")
     event_address = assembler.pc
     assembler.byte(*packed_events)
