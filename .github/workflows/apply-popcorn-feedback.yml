@@ -25,7 +25,7 @@ jobs:
       - name: Reassemble supplied Popcorn MIDI
         run: |
           git fetch origin build/popcorn-pr2-prg --depth=1
-          for n in 00 01 02 03 04 05 06 07; do
+          for n in 00 01 02 03a 03b 04 05 06 07; do
             git show FETCH_HEAD:build_input/chunk_${n}.b64
             printf '\n'
           done | base64 --decode > /tmp/popcorn.mid
