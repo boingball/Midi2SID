@@ -41,8 +41,11 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertEqual([note.pitch if note else None for note in two_voices], [72, None, 60])
 
     def test_whole_song_score_prefers_recurring_pipe_melody(self):
+        # A lone long high note must not beat a recurring monophonic melody.
+        # Use enough melody events to model a complete song rather than a tiny
+        # phrase; the supplied Popcorn MIDI has 449 notes on its lead channel.
         notes = [sid_midi.Note(0, 2400, 83, 84, 7, 84)]
-        for index in range(24):
+        for index in range(300):
             start = 3000 + index * 60
             notes.append(sid_midi.Note(start, start + 30, 79 + index % 5, 112, 5, 79))
             notes.append(sid_midi.Note(start, start + 55, 40 + index % 3, 104, 0, 35))
