@@ -1,0 +1,35 @@
+name: build-popcorn-prg
+
+on:
+  push:
+    branches:
+      - build/popcorn-pr2-prg
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reassemble MIDI
+        run: |
+          cat build_input/chunk_*.b64 | base64 --decode > popcorn.mid
+          test "$(wc -c < popcorn.mid)" -eq 21287
+      - name: Build Popcorn PRG
+        run: |
+          python midi2sid.py popcorn.mid popcorn-pr2.prg --title "POPCORN" --video pal --drums smart --filter off --feel tight
+          test -s popcorn-pr2.prg
+          python - <<'PY'
+          from pathlib import Path
+          data = Path('popcorn-pr2.prg').read_bytes()
+          assert data[:2] == b'\x01\x08', data[:2]
+          print(f'PRG size: {len(data)} bytes')
+          PY
+      - name: Upload PRG
+        uses: actions/upload-artifact@v4
+        with:
+          name: popcorn-pr2-prg
+          path: popcorn-pr2.prg
+          if-no-files-found: error
