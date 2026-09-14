@@ -40,6 +40,41 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertEqual([note.pitch if note else None for note in one_voices], [60, None, None])
         self.assertEqual([note.pitch if note else None for note in two_voices], [72, None, 60])
 
+    def test_whole_song_score_prefers_recurring_pipe_melody(self):
+        # A lone long high note must not beat a recurring monophonic melody.
+        # Use enough melody events to model a complete song rather than a tiny
+        # phrase; the supplied Popcorn MIDI has 449 notes on its lead channel.
+        notes = [sid_midi.Note(0, 2400, 83, 84, 7, 84)]
+        for index in range(300):
+            start = 3000 + index * 60
+            notes.append(sid_midi.Note(start, start + 30, 79 + index % 5, 112, 5, 79))
+            notes.append(sid_midi.Note(start, start + 55, 40 + index % 3, 104, 0, 35))
+        self.assertEqual(sid_midi._select_lead_channel(notes), 5)
+
+    def test_selected_melody_channel_beats_short_arpeggio(self):
+        notes = [
+            sid_midi.Note(0, 120, 84, 112, 5, 79),
+            sid_midi.Note(0, 12, 96, 127, 2, 102),
+            sid_midi.Note(0, 120, 40, 104, 0, 35),
+        ]
+        voices, _, _ = sid_midi._choose_voices(notes, lead_channel=5)
+        self.assertEqual(voices[0].channel, 5)
+        self.assertEqual(voices[2].channel, 0)
+        self.assertIsNone(voices[1])
+
+    def test_pipe_patch_is_bright_pulse_lead(self):
+        self.assertEqual(sid_midi.PATCHES["pipe"].waveform, sid_midi.PULSE)
+        self.assertGreaterEqual(sid_midi.PATCHES["pipe"].sustain, 12)
+
+    def test_lead_sustain_is_mixed_above_backing_and_bass(self):
+        note = sid_midi.Note(0, 120, 72, 112, 5, 79)
+        levels = [
+            sid_midi._patch_registers(note, 0, voice, sid_midi.PAL_SID_CLOCK, "tight")[6] >> 4
+            for voice in range(3)
+        ]
+        self.assertGreater(levels[0], levels[1])
+        self.assertGreater(levels[0], levels[2])
+
     def test_tight_feel_uses_fast_attack_and_velocity_floor(self):
         note = sid_midi.Note(0, 96, 60, 1, 0, 48)
         tight = sid_midi.frames_for([note], 96, feel="tight")[0]
@@ -142,6 +177,16 @@ class PrgTests(unittest.TestCase):
         self.assertEqual(data[:2], b"\x01\x08")
         self.assertIn(b"2061", data[:16])
         self.assertIn(bytes([build_prg.screen_code(ch) for ch in "TINY"]), data)
+
+    def test_prg_contains_pitch_reactive_scope_ui(self):
+        frame = bytes([0] * 24 + [15])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "scope.prg"
+            build_prg.build_prg([frame], output, "SCOPE")
+            data = output.read_bytes()
+        self.assertIn(bytes(build_prg.screen_code(ch) for ch in "1 SAFE  2 SCOPE"), data)
+        self.assertIn(bytes(build_prg.screen_code(ch) for ch in "..-->>>--..<<<--"), data)
+        self.assertIn(bytes(build_prg.screen_code(ch) for ch in "BASS/DRUM"), data)
 
     def test_bad_frame_size_is_rejected(self):
         with self.assertRaises(ValueError):

@@ -70,7 +70,10 @@ PATCHES = {
     "ensemble":   Patch(PULSE, 7, 4, 10, 8, 0x700, vibrato=10, pwm_depth=0x240, filter_cutoff=1250, resonance=6),
     "brass":      Patch(SAW, 1, 4, 11, 5, filter_cutoff=950, resonance=10),
     "reed":       Patch(PULSE, 2, 5, 10, 5, 0x420, vibrato=9, pwm_depth=0x100, filter_cutoff=1450, resonance=4),
-    "pipe":       Patch(TRIANGLE, 2, 3, 12, 5, vibrato=11),
+    # GM pipe/ocarina parts are often the actual tune in downloadable MIDIs.
+    # Triangle was too quiet beside two pulse voices, so use a bright, nearly
+    # square pulse that reads as a classic SID lead without harsh sync.
+    "pipe":       Patch(PULSE, 0, 3, 13, 3, 0x780, vibrato=8, pwm_depth=0x080),
     "lead":       Patch(PULSE, 0, 3, 12, 4, 0x800, vibrato=12, pwm_depth=0x180, filter_cutoff=1500, resonance=7, sync=True),
     "pad":        Patch(PULSE, 9, 4, 9, 10, 0x900, vibrato=7, pwm_depth=0x300, filter_cutoff=850, resonance=8),
     "effects":    Patch(SAW, 1, 7, 7, 8, vibrato=28, filter_cutoff=1200, resonance=12, ring=True),
@@ -80,6 +83,20 @@ PATCHES = {
 }
 
 LFO = (0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, -0.5)
+
+LEAD_FAMILY_SCORE = {
+    "lead": 1000, "pipe": 850, "reed": 700, "brass": 550,
+    "ensemble": 350, "strings": 320, "organ": 250, "guitar": 120,
+    "piano": 80, "chromatic": 80, "pad": 100, "ethnic": 100,
+    "effects": -300, "bass": -1000, "percussive": -300, "sfx": -400,
+}
+
+MIDDLE_FAMILY_SCORE = {
+    "ensemble": 500, "strings": 460, "pad": 420, "organ": 360,
+    "brass": 220, "reed": 180, "guitar": 140, "piano": 120,
+    "chromatic": 100, "pipe": 80, "lead": 80, "ethnic": 60,
+    "effects": -300, "bass": -450, "percussive": -500, "sfx": -450,
+}
 
 
 def vlq(data: bytes, position: int) -> tuple[int, int]:
@@ -177,49 +194,143 @@ def sid_frequency(pitch: float, clock: int = PAL_SID_CLOCK) -> int:
     return max(1, min(0xffff, round(hz * (1 << 24) / clock)))
 
 
+def _coverage(notes: list[Note]) -> int:
+    """Return channel activity in ticks with overlapping notes counted once."""
+    intervals = sorted((note.start, note.end) for note in notes)
+    if not intervals:
+        return 0
+    start, end = intervals[0]
+    total = 0
+    for next_start, next_end in intervals[1:]:
+        if next_start <= end:
+            end = max(end, next_end)
+        else:
+            total += end - start
+            start, end = next_start, next_end
+    return total + end - start
+
+
+def _max_polyphony(notes: list[Note]) -> int:
+    events: list[tuple[int, int]] = []
+    for note in notes:
+        events.extend(((note.start, 1), (note.end, -1)))
+    active = maximum = 0
+    for _, change in sorted(events, key=lambda item: (item[0], item[1])):
+        active += change
+        maximum = max(maximum, active)
+    return maximum
+
+
+def _select_lead_channel(notes: list[Note]) -> int | None:
+    """Identify the song's melodic channel before reducing it frame by frame.
+
+    Re-electing the lead from every simultaneous chord rewards short arpeggios
+    and makes a recognisable melody jump between SID oscillators. A whole-song
+    channel score gives voice one a stable owner while still allowing fallback
+    material to play during rests in that channel.
+    """
+    channels: dict[int, list[Note]] = defaultdict(list)
+    for note in notes:
+        if note.channel != 9:
+            channels[note.channel].append(note)
+    if not channels:
+        return None
+    song_end = max(note.end for channel_notes in channels.values() for note in channel_notes)
+    scored: list[tuple[float, float, int, int]] = []
+    for channel, channel_notes in channels.items():
+        family_counts: dict[str, int] = defaultdict(int)
+        for note in channel_notes:
+            family_counts[family(note.program)] += 1
+        dominant_family = max(family_counts, key=family_counts.get)
+        count = len(channel_notes)
+        average_pitch = sum(note.pitch for note in channel_notes) / count
+        average_velocity = sum(note.velocity for note in channel_notes) / count
+        activity = _coverage(channel_notes) / max(1, song_end)
+        polyphony_penalty = max(0, _max_polyphony(channel_notes) - 1) * 100
+        score = (
+            LEAD_FAMILY_SCORE.get(dominant_family, 0)
+            + min(count, 256) * 2
+            + average_pitch * 4
+            + average_velocity * 2
+            + min(1.0, activity) * 300
+            - polyphony_penalty
+        )
+        scored.append((score, average_pitch, count, channel))
+    return max(scored)[3]
+
+
 def _choose_voices(
-    tones: list[Note], previous_lead: int | None = None,
-    previous_middle: int | None = None,
-) -> tuple[list[Note | None], int | None, int | None]:
-    """Choose lead, accompaniment and bass while preserving melodic continuity."""
-    by_pitch: dict[int, Note] = {}
+    tones: list[Note], previous_lead: tuple[int, int] | int | None = None,
+    previous_middle: tuple[int, int] | int | None = None,
+    lead_channel: int | None = None,
+) -> tuple[list[Note | None], tuple[int, int] | None, tuple[int, int] | None]:
+    """Choose stable lead, restrained accompaniment and bass SID voices."""
+    unique: dict[tuple[int, int], Note] = {}
     for note in tones:
-        old = by_pitch.get(note.pitch)
-        if old is None or note.velocity > old.velocity:
-            by_pitch[note.pitch] = note
-    pitches = sorted(by_pitch)
-    if not pitches:
+        key = note.channel, note.pitch
+        old = unique.get(key)
+        if old is None or (note.velocity, note.start) > (old.velocity, old.start):
+            unique[key] = note
+    pool = list(unique.values())
+    if not pool:
         return [None, None, None], None, None
-    bass_pitch = pitches[0]
-    candidates = pitches[1:] or pitches
 
-    def lead_score(pitch: int) -> int:
-        note = by_pitch[pitch]
-        bonus = {
-            "lead": 500, "brass": 220, "reed": 180, "pipe": 150,
-            "strings": 100, "pad": -180, "bass": -100,
-        }.get(family(note.program), 0)
-        short = 2 * max(0, 300 - min(300, note.end - note.start))
-        continuity = -3 * abs(pitch - previous_lead) if previous_lead is not None else 0
-        return bonus + short + note.velocity + continuity
+    preferred = [note for note in pool if lead_channel is not None and note.channel == lead_channel]
 
-    lead_pitch = max(candidates, key=lead_score)
-    middle_pitches = [pitch for pitch in pitches if pitch not in {bass_pitch, lead_pitch}]
-    if previous_middle in middle_pitches:
-        middle_pitch = previous_middle
-    elif middle_pitches:
-        middle_pitch = middle_pitches[-1]
-    else:
-        middle_pitch = None
+    def lead_score(note: Note) -> int:
+        continuity = 250 if previous_lead == (note.channel, note.pitch) else 0
+        return (
+            {
+                "lead": 650, "pipe": 550, "reed": 450, "brass": 350,
+                "ensemble": 180, "strings": 160, "organ": 120,
+                "pad": -100, "effects": -220, "bass": -600,
+                "percussive": -400, "sfx": -350,
+            }.get(family(note.program), 0)
+            + note.pitch * 4
+            + note.velocity * 2
+            + min(note.end - note.start, 240)
+            + continuity
+        )
 
-    # Never duplicate one MIDI note across SID oscillators. Apart from making
-    # sparse passages needlessly loud, tiny phase differences turn duplicated
-    # pulse/triangle notes into clicks and a ragged chorus. With two pitches we
-    # keep lead and bass; the middle voice is only used for a genuinely distinct
-    # note.
-    bass = by_pitch[bass_pitch] if bass_pitch != lead_pitch else None
-    middle = by_pitch[middle_pitch] if middle_pitch is not None else None
-    return [by_pitch[lead_pitch], middle, bass], lead_pitch, middle_pitch
+    lead = max(preferred or pool, key=lead_score)
+    lead_key = lead.channel, lead.pitch
+
+    # Prefer an actual GM bass channel for voice three. Falling back to the
+    # lowest remaining pitch keeps the old two-note lead/bass behaviour.
+    remaining = [
+        note for note in pool
+        if (note.channel, note.pitch) != lead_key and note.pitch != lead.pitch
+    ]
+    bass_candidates = [note for note in remaining if family(note.program) == "bass"]
+    bass_pool = bass_candidates or remaining
+    bass = min(
+        bass_pool,
+        key=lambda note: (note.pitch, -(note.end - note.start), -note.velocity),
+    ) if bass_pool else None
+
+    accompaniment = [
+        note for note in remaining
+        if bass is None or (note.channel, note.pitch) != (bass.channel, bass.pitch)
+    ]
+
+    def middle_score(note: Note) -> int:
+        continuity = 350 if previous_middle == (note.channel, note.pitch) else 0
+        return (
+            MIDDLE_FAMILY_SCORE.get(family(note.program), 0)
+            + min(note.end - note.start, 480)
+            + note.velocity
+            + continuity
+            - abs(note.pitch - lead.pitch)
+        )
+
+    middle = max(accompaniment, key=middle_score) if accompaniment else None
+    # A frantic effects/arpeggio note should not fill a SID voice merely because
+    # one is free. Silence is cleaner than constant retrigger chatter.
+    if middle is not None and middle_score(middle) < 180:
+        middle = None
+
+    middle_key = (middle.channel, middle.pitch) if middle is not None else None
+    return [lead, middle, bass], lead_key, middle_key
 
 
 def _patch_registers(
@@ -248,7 +359,11 @@ def _patch_registers(
         attack = patch.attack
         release = patch.release
         velocity_scale = note.velocity / 127
-    velocity_sustain = max(1, min(15, round(patch.sustain * velocity_scale)))
+    # SID has one master volume rather than a mixer per oscillator. Balance the
+    # automatic reduction through ADSR sustain: voice one stays prominent while
+    # backing and bass retain headroom instead of masking the melody.
+    role_scale = (1.18, 0.78, 0.72)[voice]
+    velocity_sustain = max(1, min(15, round(patch.sustain * velocity_scale * role_scale)))
     control = patch.waveform | GATE
     if patch.ring and voice:
         control |= RING
@@ -333,6 +448,7 @@ def frames_for(
     frames: list[bytes] = []
     previous_lead = previous_middle = None
     previous_sources: list[tuple | None] = [None, None, None]
+    lead_channel = _select_lead_channel(notes)
 
     for frame in range(total):
         # Keep the MIDI clock fractional. Rounding 5.28 ticks/frame to 5 made
@@ -347,7 +463,7 @@ def frames_for(
             and n.end * tick_denominator > start_tick_scaled
         ]
         voices, previous_lead, previous_middle = _choose_voices(
-            live_tones, previous_lead, previous_middle
+            live_tones, previous_lead, previous_middle, lead_channel=lead_channel
         )
         if not live_tones:
             previous_lead = previous_middle = None
