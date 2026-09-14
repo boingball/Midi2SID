@@ -3,10 +3,17 @@
 Smart MIDI-to-Commodore 64 SID conversion, inspired by the voice-routing work
 in [MIDI2AY](https://github.com/boingball/Midi2AY).
 
-The first version reads format 0/1 PPQN Standard MIDI files and creates a
-self-running C64 `.prg`. It automatically reduces polyphonic arrangements to
-the SID's three voices, maps all 128 General MIDI programs to SID synth
-families, and gives MIDI channel 10 a dedicated synthesized drum path.
+MIDI2SID reads format 0/1 PPQN Standard MIDI files and creates a self-running
+C64 `.prg`. It automatically reduces polyphonic arrangements to the SID's three
+voices, maps all 128 General MIDI programs to SID synth families, and gives MIDI
+channel 10 a dedicated synthesized drum path.
+
+Before rendering individual frames, the arranger scores each non-drum MIDI
+channel across the complete song to identify its likely melody. SID voice one
+then follows that channel whenever it is active, voice two favours sustained
+harmonic backing, and voice three favours a genuine General MIDI bass part.
+Role-balanced ADSR sustain leaves headroom for the melody instead of allowing
+bass and busy arpeggios to mask it.
 
 ## Quick start
 
@@ -51,9 +58,11 @@ automatic conversions. `--feel expressive` restores animated PWM and the slower
 family-specific attack/release values for files arranged around sustained pads
 and strings.
 
-The generated player starts in safe visual mode 1 with a black border. During
-playback, keys 1-5 select: safe/static, voice lights, slow border, both, and a
-slow demo colour mode. No mode changes colour faster than about 3 Hz.
+The generated player starts in visual mode 2, showing three pitch-reactive SID
+traces for lead, backing and bass/drums. During playback, keys 1-5 select:
+safe/static, scopes, slow border, scopes plus border, and slow demo mode. The
+scope animation follows each oscillator's gate and frequency while colour changes
+remain deliberately slow.
 
 This is an automatic chip-music arrangement, not a transparent reproduction of
 the source MIDI. Dense chords must be reduced to three voices, and drums borrow
@@ -73,6 +82,8 @@ voice three while they sound.
 ```sh
 python3 -m unittest -v
 ```
+
+GitHub Actions runs the same test suite for every push and pull request.
 
 ## Licence
 
