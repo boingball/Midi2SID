@@ -14,6 +14,7 @@ EVENT_END = 0xff
 # follow without adding a 20 ms silent frame.
 EVENT_RETRIGGER_BASE = 0xf0
 MAX_END_ADDRESS = 0xcfff
+SCOPE_WIDTH = 12
 
 
 class Assembler:
@@ -225,7 +226,10 @@ def screen_code(character: str) -> int:
         return ord(character) - 64
     if "0" <= character <= "9":
         return ord(character)
-    return {" ": 32, "-": 45, ".": 46, "/": 47, ":": 58}.get(character, 32)
+    return {
+        " ": 32, "-": 45, ".": 46, "/": 47, ":": 58,
+        "<": 60, ">": 62,
+    }.get(character, 32)
 
 
 def _basic_stub() -> bytes:
@@ -236,6 +240,7 @@ def _basic_stub() -> bytes:
 
 def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler = Assembler(ENTRY_ADDRESS)
+    zp_phase1, zp_phase2, zp_phase3 = 0xee, 0xef, 0xf0
     zp_colour, zp_frame, zp_mode = 0xf2, 0xf3, 0xf4
     zp_register, zp_ring = 0xf5, 0xf6
     zp_flags, zp_bits = 0xf7, 0xf8
@@ -278,9 +283,13 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.byte(0xca); assembler.branch(0x10, "clear_sid")
     assembler.imm(0xa9, 15); assembler.absolute(0x8d, 0xd418)
     assembler.imm(0xa9, 0)
-    for address in (zp_colour, zp_frame, zp_ring, zp_flags, zp_bits, zp_copy_len, zp_copy_pos, zp_wait):
+    for address in (
+        zp_phase1, zp_phase2, zp_phase3, zp_colour, zp_frame, zp_ring,
+        zp_flags, zp_bits, zp_copy_len, zp_copy_pos, zp_wait,
+    ):
         assembler.zp(0x85, address)
-    assembler.imm(0xa9, 1); assembler.zp(0x85, zp_mode)
+    # The pitch-reactive scopes are safe and useful, so start in mode 2.
+    assembler.imm(0xa9, 2); assembler.zp(0x85, zp_mode)
     # CIA 1 port A selects keyboard rows; port B reads columns.
     assembler.imm(0xa9, 0xff); assembler.absolute(0x8d, 0xdc02)
     assembler.imm(0xa9, 0x00); assembler.absolute(0x8d, 0xdc03)
@@ -338,7 +347,10 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     restart_hi_at = len(assembler.code) + 1
     assembler.imm(0xa9, 0); assembler.zp(0x85, zp_hi)
     assembler.imm(0xa9, 0)
-    for address in (zp_ring, zp_flags, zp_bits, zp_copy_len, zp_copy_pos, zp_wait):
+    for address in (
+        zp_phase1, zp_phase2, zp_phase3, zp_ring, zp_flags, zp_bits,
+        zp_copy_len, zp_copy_pos, zp_wait,
+    ):
         assembler.zp(0x85, address)
     assembler.byte(0x60)
 
@@ -407,19 +419,53 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.label("keys_done")
     assembler.imm(0xa9, 0xff); assembler.absolute(0x8d, 0xdc00); assembler.byte(0x60)
 
-    assembler.label("draw_lights")
-    for control, cell in ((0xd404, 0x0635), (0xd40b, 0x0643), (0xd412, 0x0651)):
+    # Three compact travelling traces replace the old single flashing dot per
+    # oscillator. Their phase advances at 12.5 Hz and the SID frequency high
+    # byte selects a 1-4 character step, giving a stable pitch-reactive display
+    # without touching audio timing or rapidly flashing the border.
+    assembler.label("draw_scopes")
+    scope_rows = (0x0631, 0x063e, 0x064b)
+    for index, (control, frequency_hi, phase, screen) in enumerate(zip(
+        (0xd404, 0xd40b, 0xd412),
+        (0xd401, 0xd408, 0xd40f),
+        (zp_phase1, zp_phase2, zp_phase3),
+        scope_rows,
+    )):
         assembler.absolute(0xad, control); assembler.imm(0x29, 1)
-        assembler.branch(0xf0, f"off_{cell:04x}")
-        assembler.imm(0xa9, 0xa0); assembler.branch(0xd0, f"draw_{cell:04x}")
-        assembler.label(f"off_{cell:04x}"); assembler.imm(0xa9, 32)
-        assembler.label(f"draw_{cell:04x}"); assembler.absolute(0x8d, cell)
+        assembler.branch(0xf0, f"scope_clear_{index}")
+        assembler.zp(0xa5, zp_frame); assembler.imm(0x29, 3)
+        assembler.branch(0xd0, f"scope_render_{index}")
+        assembler.absolute(0xad, frequency_hi)
+        for _ in range(6):
+            assembler.byte(0x4a)                  # LSR A
+        assembler.byte(0x18); assembler.imm(0x69, 1)
+        assembler.zp(0x65, phase); assembler.imm(0x29, 0x0f)
+        assembler.zp(0x85, phase)
+        assembler.label(f"scope_render_{index}")
+        assembler.imm(0xa2, 0)
+        assembler.label(f"scope_loop_{index}")
+        assembler.byte(0x8a, 0x18)                # TXA / CLC
+        assembler.zp(0x65, phase); assembler.imm(0x29, 0x0f)
+        assembler.byte(0xa8)                      # TAY
+        assembler.absolute(0xb9, "scope_chars")  # LDA scope_chars,Y
+        assembler.absolute(0x9d, screen)          # STA screen,X
+        assembler.byte(0xe8); assembler.imm(0xe0, SCOPE_WIDTH)
+        assembler.branch(0xd0, f"scope_loop_{index}")
+        assembler.absolute(0x4c, f"scope_done_{index}")
+        assembler.label(f"scope_clear_{index}")
+        assembler.imm(0xa2, SCOPE_WIDTH - 1); assembler.imm(0xa9, 32)
+        assembler.label(f"scope_clear_loop_{index}")
+        assembler.absolute(0x9d, screen)
+        assembler.byte(0xca); assembler.branch(0x10, f"scope_clear_loop_{index}")
+        assembler.label(f"scope_done_{index}")
     assembler.byte(0x60)
 
-    assembler.label("blank_lights")
-    assembler.imm(0xa9, 32)
-    for cell in (0x0635, 0x0643, 0x0651):
-        assembler.absolute(0x8d, cell)
+    assembler.label("blank_scopes")
+    assembler.imm(0xa2, SCOPE_WIDTH - 1); assembler.imm(0xa9, 32)
+    assembler.label("blank_scope_loop")
+    for screen in scope_rows:
+        assembler.absolute(0x9d, screen)
+    assembler.byte(0xca); assembler.branch(0x10, "blank_scope_loop")
     assembler.byte(0x60)
 
     assembler.label("slow_colour")
@@ -431,22 +477,22 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.label("visual")
     assembler.absolute(0x20, "scan_keys"); assembler.zp(0xe6, zp_frame)
     assembler.zp(0xa5, zp_mode); assembler.imm(0xc9, 1); assembler.branch(0xf0, "mode_safe")
-    assembler.imm(0xc9, 2); assembler.branch(0xf0, "mode_lights")
+    assembler.imm(0xc9, 2); assembler.branch(0xf0, "mode_scope")
     assembler.imm(0xc9, 3); assembler.branch(0xf0, "mode_border")
     assembler.imm(0xc9, 4); assembler.branch(0xf0, "mode_both")
     # Mode 5 remains deliberately slow: colour changes at roughly 3 Hz PAL.
-    assembler.absolute(0x20, "draw_lights"); assembler.absolute(0x20, "slow_colour")
+    assembler.absolute(0x20, "draw_scopes"); assembler.absolute(0x20, "slow_colour")
     assembler.zp(0xa5, zp_colour); assembler.imm(0x29, 7); assembler.absolute(0x8d, 0xd021); assembler.byte(0x60)
     assembler.label("mode_safe")
     assembler.imm(0xa9, 0); assembler.absolute(0x8d, 0xd020); assembler.absolute(0x8d, 0xd021)
-    assembler.absolute(0x20, "blank_lights"); assembler.byte(0x60)
-    assembler.label("mode_lights")
+    assembler.absolute(0x20, "blank_scopes"); assembler.byte(0x60)
+    assembler.label("mode_scope")
     assembler.imm(0xa9, 0); assembler.absolute(0x8d, 0xd020); assembler.absolute(0x8d, 0xd021)
-    assembler.absolute(0x4c, "draw_lights")
+    assembler.absolute(0x4c, "draw_scopes")
     assembler.label("mode_border")
-    assembler.absolute(0x20, "blank_lights"); assembler.absolute(0x4c, "slow_colour")
+    assembler.absolute(0x20, "blank_scopes"); assembler.absolute(0x4c, "slow_colour")
     assembler.label("mode_both")
-    assembler.absolute(0x20, "draw_lights"); assembler.absolute(0x4c, "slow_colour")
+    assembler.absolute(0x20, "draw_scopes"); assembler.absolute(0x4c, "slow_colour")
 
     def add_text(label: str, value: str) -> None:
         assembler.label(label)
@@ -455,11 +501,13 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     add_text("logo", "MIDI2SID")
     clean_title = " ".join(title.upper().replace("_", " ").split())[:38] or "UNTITLED"
     add_text("title", clean_title)
-    add_text("voice1", "VOICE 1")
-    add_text("voice2", "VOICE 2")
-    add_text("voice3", "VOICE 3")
-    add_text("keys1", "1 SAFE  2 LIGHTS  3 BORDER")
+    add_text("voice1", "LEAD")
+    add_text("voice2", "BACKING")
+    add_text("voice3", "BASS/DRUM")
+    add_text("keys1", "1 SAFE  2 SCOPE  3 BORDER")
     add_text("keys2", "4 BOTH  5 DEMO")
+    assembler.label("scope_chars")
+    assembler.byte(*(screen_code(ch) for ch in "..-->>>--..<<<--"))
     assembler.label("events")
     event_address = assembler.pc
     assembler.byte(*packed_events)
