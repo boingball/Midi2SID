@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 
 import build_prg
@@ -82,6 +83,38 @@ class SidSynthesisTests(unittest.TestCase):
             notes, lead_channel=5, reserve_lead=False
         )
         self.assertIsNotNone(voices[0])
+
+    def test_reserve_lead_allows_fallback_during_a_long_lead_absence(self):
+        # A synth lead riff (channel 5) that only plays briefly at the start
+        # and end of a song, with a guitar solo (channel 7) filling a long
+        # middle stretch, reproduces a real full-band arrangement: the lead
+        # channel is still correctly identified as the song's melody, but
+        # voice one must not go silent for the whole gap where it isn't
+        # playing while good fallback material is available. Reserving the
+        # full first-note-to-last-note span (rather than just the lead's own
+        # notes and short rests between them) silenced voice one for the
+        # entire solo instead of falling back to it.
+        lead_notes = [
+            sid_midi.Note(0, 40, 76, 110, 5, 80),
+            sid_midi.Note(40, 100, 79, 110, 5, 80),
+            sid_midi.Note(3000, 3040, 76, 110, 5, 80),
+            sid_midi.Note(3040, 3100, 79, 110, 5, 80),
+        ]
+        solo_notes = [
+            sid_midi.Note(start, start + 90, 60 + (start // 100) % 5, 100, 7, 30)
+            for start in range(1000, 2000, 100)
+        ]
+        notes = lead_notes + solo_notes
+        self.assertEqual(sid_midi._select_lead_channel(notes), 5)
+        frames = sid_midi.frames_for(notes, 120, tempos=[(0, 500_000)])
+        mid_tick = 1500
+        tempo = 500_000
+        ticks_per_frame = Fraction(120 * 1_000_000, tempo * 50)
+        mid_frame = mid_tick * ticks_per_frame.denominator // ticks_per_frame.numerator
+        self.assertTrue(
+            frames[mid_frame][4] & sid_midi.GATE,
+            "voice one went silent during the guitar solo instead of falling back",
+        )
 
     def test_pipe_patch_is_bright_pulse_lead(self):
         self.assertEqual(sid_midi.PATCHES["pipe"].waveform, sid_midi.PULSE)

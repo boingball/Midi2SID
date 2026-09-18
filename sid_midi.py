@@ -478,9 +478,26 @@ def frames_for(
     previous_lead = previous_middle = None
     previous_sources: list[tuple | None] = [None, None, None]
     lead_channel = _select_lead_channel(notes)
-    lead_notes = [note for note in notes if note.channel == lead_channel]
-    lead_start = min((note.start for note in lead_notes), default=None)
-    lead_end = max((note.end for note in lead_notes), default=None)
+    lead_notes = sorted((note for note in notes if note.channel == lead_channel), key=lambda n: n.start)
+    # Reserve voice one only across the lead's own notes and short rests
+    # between them, not the whole first-to-last-note span. A real arrangement
+    # often puts the identified lead channel's melody in only some sections
+    # (e.g. a synth riff that sits out an entire guitar solo played on another
+    # channel); reserving the full span silenced voice one for that solo
+    # instead of letting a good fallback candidate play it. A gap longer than
+    # a bar (4 beats) is treated as the lead genuinely handing off, not a
+    # breath, so fallback is allowed again until the lead returns.
+    lead_intervals: list[tuple[int, int]] = []
+    if lead_notes:
+        max_gap = max(1, division * 4)
+        interval_start = lead_notes[0].start
+        interval_end = lead_notes[0].end
+        for note in lead_notes[1:]:
+            if note.start - interval_end > max_gap:
+                lead_intervals.append((interval_start, interval_end))
+                interval_start = note.start
+            interval_end = max(interval_end, note.end)
+        lead_intervals.append((interval_start, interval_end))
     # Keep the last melodic oscillator/ADSR setup so a note-off frame can clear
     # GATE without also destroying waveform and release. The SID envelope then
     # gets to perform the release phase naturally until the next note arrives.
@@ -498,10 +515,10 @@ def frames_for(
             and n.start * tick_denominator < end_tick_scaled
             and n.end * tick_denominator > start_tick_scaled
         ]
-        reserve_lead = (
-            lead_start is not None and lead_end is not None
-            and end_tick_scaled > lead_start * tick_denominator
-            and start_tick_scaled < lead_end * tick_denominator
+        reserve_lead = any(
+            end_tick_scaled > interval_start * tick_denominator
+            and start_tick_scaled < interval_end * tick_denominator
+            for interval_start, interval_end in lead_intervals
         )
         voices, previous_lead, previous_middle = _choose_voices(
             live_tones, previous_lead, previous_middle,
