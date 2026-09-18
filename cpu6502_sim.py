@@ -110,14 +110,22 @@ class CPU:
 
     # -- run ------------------------------------------------------------
     def run(self, start: int, max_steps: int = 2_000_000, stop_at: set[int] | None = None) -> None:
+        """Run until pc is in stop_at, for up to max_steps *this call*.
+
+        max_steps is a per-call budget, not a lifetime cap: self.steps keeps
+        accumulating across calls (useful for diagnostics), but reusing one
+        CPU for several run() calls - boot, then drive a subroutine directly
+        - must not make a later call's budget appear already spent.
+        """
         self.pc = start
         stop_at = stop_at or set()
-        while self.steps < max_steps:
+        executed = 0
+        while executed < max_steps:
             if self.pc in stop_at:
                 return
             self.step()
-            if self.steps >= max_steps:
-                raise RuntimeError(f"6502 sim exceeded {max_steps} steps (runaway loop?) at pc=${self.pc:04x}")
+            executed += 1
+        raise RuntimeError(f"6502 sim exceeded {max_steps} steps (runaway loop?) at pc=${self.pc:04x}")
 
     def step(self) -> None:
         self.steps += 1
