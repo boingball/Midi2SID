@@ -11,18 +11,24 @@ from sid_midi import compile_sid_frames
 
 def convert(
     midi: Path, output: Path, title: str | None, video: str,
-    drums: str, filter_mode: str, feel: str,
+    drums: str, filter_mode: str, feel: str, artwork: Path | None = None,
 ) -> None:
     frames = compile_sid_frames(
         midi, video=video, drums=drums, filter_mode=filter_mode, feel=feel,
     )
-    build_prg(frames, output, title or midi.stem, video=video)
+    artwork_bytes = None
+    if artwork is not None:
+        from artwork import render_artwork
+        artwork_bytes = render_artwork(artwork)
+    build_prg(frames, output, title or midi.stem, video=video, artwork=artwork_bytes)
     event_size = len(encode_events(frames))
     packed_size = len(pack_lzss(encode_events(frames)))
     print(
         f"wrote {output} ({len(frames)} {video.upper()} frames, "
         f"{event_size} event bytes, {packed_size} LZSS-packed, "
-        f"drums={drums}, filter={filter_mode}, feel={feel})"
+        f"drums={drums}, filter={filter_mode}, feel={feel}"
+        + (f", artwork={artwork.name}" if artwork is not None else "")
+        + ")"
     )
 
 
@@ -39,8 +45,14 @@ def main() -> None:
                         help="shared SID filter; off is the clean 6581-safe default")
     parser.add_argument("--feel", choices=("tight", "expressive"), default="tight",
                         help="tight gives precise chip attacks; expressive keeps slower GM envelopes")
+    parser.add_argument("--artwork", type=Path,
+                        help="JPG/PNG background image, dithered to a C64 hi-res bitmap "
+                             "(needs Pillow: pip install Pillow)")
     args = parser.parse_args()
-    convert(args.midi, args.output, args.title, args.video, args.drums, args.filter, args.feel)
+    convert(
+        args.midi, args.output, args.title, args.video, args.drums, args.filter, args.feel,
+        artwork=args.artwork,
+    )
 
 
 if __name__ == "__main__":

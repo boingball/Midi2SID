@@ -336,7 +336,10 @@ def _basic_stub() -> bytes:
     return bytes((0x0b, 0x08, 0x0a, 0x00, 0x9e, 0x32, 0x30, 0x36, 0x31, 0x00, 0x00, 0x00))
 
 
-def _player(title: str, packed_events: bytes, video: str) -> bytes:
+def _player(
+    title: str, packed_events: bytes, video: str,
+    artwork: tuple[bytes, bytes] | None = None,
+) -> bytes:
     assembler = Assembler(ENTRY_ADDRESS)
     zp_phase1, zp_phase2, zp_phase3 = 0xee, 0xef, 0xf0
     zp_colour, zp_frame, zp_mode = 0xf2, 0xf3, 0xf4
@@ -345,12 +348,14 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     zp_copy_len, zp_copy_pos = 0xf9, 0xfa
     zp_lo, zp_hi, zp_wait = 0xfb, 0xfc, 0xfd
     # Font-blit machinery: a source (ROM glyph) pointer, a destination
-    # (bitmap cell) pointer, and a scratch byte, all reused later by the
-    # per-frame scope render once the one-off font copy at boot is done.
+    # (bitmap cell) pointer, a screen-colour (ink/paper) pointer, and a
+    # scratch byte. zp_src/zp_tmp are reused later by the per-frame scope
+    # render once the one-off font copy at boot is done.
     zp_str_lo, zp_str_hi = 0xe0, 0xe1
     zp_dst_lo, zp_dst_hi = 0xe2, 0xe3
     zp_src_lo, zp_src_hi = 0xe4, 0xe5
     zp_tmp = 0xe6
+    zp_scr_lo, zp_scr_hi = 0xe7, 0xe8
 
     # The whole display is one permanent VIC-II hi-res bitmap (no raster
     # split): title, labels and the oscilloscope traces are all pixels in
@@ -397,6 +402,30 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
 
     assembler.label("real_start")
     assembler.byte(0x78)                         # SEI
+    # Explicitly fix the CPU port before any $D000-$DFFF access rather than
+    # relying on the KERNAL's boot-time default: I/O visible (CHAREN=1) so
+    # the border/background clear below reaches the real VIC registers, not
+    # whatever the char ROM window would otherwise shadow them with.
+    assembler.imm(0xa9, 0x35); assembler.zp(0x85, 0x01)
+    assembler.imm(0xa9, 0); assembler.absolute(0x8d, 0xd020); assembler.absolute(0x8d, 0xd021)
+    # Every 8x8 cell's ink/paper nibble: either a uniform fill, or (with
+    # artwork) a copy of its per-cell colours from the embedded table. This
+    # must happen before the label/scope colour overrides below, which poke
+    # just their own cells afterwards so text and the scope trace stay
+    # legible regardless of what colours the artwork chose underneath them.
+    assembler.imm(0xa2, 0)
+    if artwork is None:
+        assembler.imm(0xa9, INK_PAPER)
+        assembler.label("fill_screen_colours")
+        for address in (0x0400, 0x0500, 0x0600, 0x0700):
+            assembler.absolute(0x9d, address)
+    else:
+        assembler.label("fill_screen_colours")
+        for offset, address in ((0, 0x0400), (256, 0x0500), (512, 0x0600), (768, 0x0700)):
+            assembler.absolute_plus(0xbd, "artwork_screen", offset)  # LDA artwork_screen+off,X
+            assembler.absolute(0x9d, address)                        # STA address,X
+    assembler.byte(0xe8); assembler.branch(0xd0, "fill_screen_colours")
+
     # Bank switch: CHAREN=0 makes the character ROM visible at $D000-$DFFF
     # for the CPU (this also hides VIC/SID/CIA I/O for as long as it's set,
     # so nothing below may touch $D000-$DFFF until it's restored).
@@ -404,23 +433,28 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     for label_name, (row, col) in label_rows.items():
         label_addr = assembler.labels[label_name]
         dest = cell_addr(row, col)
+        screen_addr = 0x0400 + row * 40 + col
         assembler.imm(0xa9, label_addr & 0xff); assembler.zp(0x85, zp_str_lo)
         assembler.imm(0xa9, label_addr >> 8); assembler.zp(0x85, zp_str_hi)
         assembler.imm(0xa9, dest & 0xff); assembler.zp(0x85, zp_dst_lo)
         assembler.imm(0xa9, dest >> 8); assembler.zp(0x85, zp_dst_hi)
+        assembler.imm(0xa9, screen_addr & 0xff); assembler.zp(0x85, zp_scr_lo)
+        assembler.imm(0xa9, screen_addr >> 8); assembler.zp(0x85, zp_scr_hi)
         assembler.absolute(0x20, "blit_label")
     # Restore normal I/O visibility (SID/VIC/CIA) for the rest of the program.
     assembler.imm(0xa9, 0x35); assembler.zp(0x85, 0x01)
 
-    assembler.imm(0xa9, 0); assembler.absolute(0x8d, 0xd020); assembler.absolute(0x8d, 0xd021)
-    # Every 8x8 cell's ink/paper nibble, uniform for now (per-cell colour
-    # only matters once artwork gives cells different colours).
-    assembler.imm(0xa2, 0)
-    assembler.imm(0xa9, INK_PAPER)
-    assembler.label("fill_screen_colours")
-    for address in (0x0400, 0x0500, 0x0600, 0x0700):
-        assembler.absolute(0x9d, address)
-    assembler.byte(0xe8); assembler.branch(0xd0, "fill_screen_colours")
+    # Force the oscilloscope rows' ink/paper too, so the trace stays visible
+    # over whatever the artwork chose there (its own pixels are redrawn into
+    # the bitmap every frame regardless; only the colour needs fixing once).
+    for row in scope_rows.values():
+        screen_addr = 0x0400 + row * 40 + 2
+        assembler.imm(0xa9, INK_PAPER); assembler.imm(0xa2, 0)
+        assembler.label(f"force_scope_colour_{row}")
+        assembler.absolute(0x9d, screen_addr)
+        assembler.byte(0xe8); assembler.imm(0xe0, SCOPE_WIDTH)
+        assembler.branch(0xd0, f"force_scope_colour_{row}")
+
     # Hi-res bitmap mode: bitmap at $2000, screen (ink/paper) at $0400.
     assembler.imm(0xa9, 0x3b); assembler.absolute(0x8d, 0xd011)
     assembler.imm(0xa9, 0x18); assembler.absolute(0x8d, 0xd018)
@@ -686,6 +720,16 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.byte(0xc8)
     assembler.imm(0xc0, 8)
     assembler.branch(0xd0, "blit_copy_row")
+    # Force this cell's ink/paper too, so the glyph reads clearly regardless
+    # of whatever colour artwork (or the uniform fill) put there.
+    assembler.imm(0xa9, INK_PAPER); assembler.imm(0xa0, 0)
+    assembler.byte(0x91, zp_scr_lo)                # STA (zp_scr),Y
+    assembler.zp(0xa5, zp_scr_lo)
+    assembler.byte(0x18); assembler.imm(0x69, 1)
+    assembler.zp(0x85, zp_scr_lo)
+    assembler.branch(0x90, "blit_scr_no_carry")
+    assembler.zp(0xe6, zp_scr_hi)
+    assembler.label("blit_scr_no_carry")
     assembler.zp(0xa5, zp_dst_lo)
     assembler.byte(0x18); assembler.imm(0x69, 8)
     assembler.zp(0x85, zp_dst_lo)
@@ -710,7 +754,17 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
         )
     assembler.byte(*([0] * (BITMAP_BASE - assembler.pc)))
     assembler.label("bitmap")
-    assembler.byte(*([0] * BITMAP_SIZE))
+    if artwork is None:
+        assembler.byte(*([0] * BITMAP_SIZE))
+    else:
+        artwork_bitmap, artwork_screen = artwork
+        if len(artwork_bitmap) != BITMAP_SIZE:
+            raise ValueError(f"artwork bitmap must be {BITMAP_SIZE} bytes, got {len(artwork_bitmap)}")
+        if len(artwork_screen) != 1024:
+            raise ValueError(f"artwork screen table must be 1024 bytes, got {len(artwork_screen)}")
+        assembler.byte(*artwork_bitmap)
+        assembler.label("artwork_screen")
+        assembler.byte(*artwork_screen)
 
     # The four waveform-shape picture sets (WAVE_PHASES phases each) plus
     # their pointer table live here rather than in the fixed code below
@@ -741,12 +795,15 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     return bytes(code)
 
 
-def build_prg(frames: list[bytes], output: str | Path, title: str = "MIDI2SID", video: str = "pal") -> Path:
+def build_prg(
+    frames: list[bytes], output: str | Path, title: str = "MIDI2SID", video: str = "pal",
+    artwork: tuple[bytes, bytes] | None = None,
+) -> Path:
     if video not in ("pal", "ntsc"):
         raise ValueError("video must be pal or ntsc")
     events = encode_events(frames)
     packed_events = pack_lzss(events)
-    payload = _basic_stub() + _player(title, packed_events, video)
+    payload = _basic_stub() + _player(title, packed_events, video, artwork=artwork)
     end_address = LOAD_ADDRESS + len(payload) - 1
     if end_address > MAX_END_ADDRESS:
         raise ValueError(

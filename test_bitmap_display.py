@@ -38,19 +38,26 @@ def _assemble_with_labels(title="Test Song", video="pal"):
     return code, captured["labels"]
 
 
+def _fake_char_rom() -> bytes:
+    # Each glyph's 8 bytes are its own screencode, repeated: lets tests
+    # verify addressing (right glyph -> right cell) without needing a real
+    # character ROM dump. Kept as a separate read-only buffer (not part of
+    # `mem`) so a write to a $D000-$DFFF I/O register while CHAREN is high
+    # can't appear to "corrupt" it, matching real hardware where character
+    # ROM is physically read-only.
+    rom = bytearray(4096)
+    for screencode in range(256):
+        base = screencode * 8
+        for row in range(8):
+            rom[base + row] = screencode
+    return bytes(rom)
+
+
 def _boot_memory(code, fake_rom=True):
     mem = bytearray(65536)
     mem[build_prg.ENTRY_ADDRESS:build_prg.ENTRY_ADDRESS + len(code)] = code
-    if fake_rom:
-        # Each glyph's 8 bytes are its own screencode, repeated: lets tests
-        # verify addressing (right glyph -> right cell) without needing a
-        # real character ROM dump.
-        for screencode in range(256):
-            base = 0xd000 + screencode * 8
-            for row in range(8):
-                mem[base + row] = screencode
     writes = []
-    cpu = CPU(mem)
+    cpu = CPU(mem, char_rom=_fake_char_rom() if fake_rom else None)
     cpu.io_hook = lambda addr, value: writes.append((addr, value))
     try:
         cpu.run(build_prg.ENTRY_ADDRESS, max_steps=500_000)
@@ -65,8 +72,10 @@ class BitmapDisplayTests(unittest.TestCase):
         _, writes = _boot_memory(code)
         self.assertIn((0xd011, 0x3b), writes)   # BMM|DEN|RSEL, bitmap on
         self.assertIn((0xd018, 0x18), writes)   # bitmap $2000 / screen $0400
-        self.assertEqual(writes[0], (0x01, 0x31))  # char ROM banked in first
-        self.assertIn((0x01, 0x35), writes[1:])    # and I/O restored after
+        self.assertEqual(writes[0], (0x01, 0x35))  # I/O fixed visible first
+        char_rom_in = writes.index((0x01, 0x31))    # then char ROM banked in
+        char_rom_out = writes.index((0x01, 0x35), char_rom_in)  # and restored after
+        self.assertGreater(char_rom_out, char_rom_in)
 
     def test_labels_blit_to_the_right_bitmap_cells(self):
         code, _ = _assemble_with_labels(title="Test Song")

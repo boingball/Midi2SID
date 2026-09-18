@@ -12,5 +12,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install optional test dependencies
+        # Pillow is only needed for --artwork; installed here so CI still
+        # covers it. Runtime use of the rest of midi2sid.py stays dependency-free.
+        run: pip install Pillow
       - name: Run unit tests
         run: python -m unittest -v
