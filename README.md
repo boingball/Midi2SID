@@ -64,14 +64,17 @@ and strings.
 The generated player starts in visual mode 2. The whole screen is a real
 VIC-II hi-res bitmap (not text mode): the title and labels are blitted from
 the real character ROM at boot, and each SID voice gets a genuine travelling
-pixel oscilloscope trace (a shared triangle-wave picture reused per voice,
-the same idea as the pitch-reactive scope in
-[MIDI2AY](https://github.com/boingball/Midi2AY)) instead of PETSCII
-characters. During playback, keys 1-5 select: safe/static, scopes, slow
-border, scopes plus border, and slow demo mode (modes 4 and 5 currently look
-the same, since the old background-colour pulse in mode 5 has no visible
-effect once the screen is bitmap). The scope animation follows each
-oscillator's gate and frequency while colour changes remain deliberately slow.
+pixel oscilloscope trace shaped to match what that voice is actually
+synthesising: a smooth ramp for triangle, a rising ramp for sawtooth, a
+square-edged trace for pulse, or a jagged static-like trace for noise, read
+live from the voice's own SID control register. This is the same
+phase-cycling-picture idea MIDI2AY uses for its pitch-reactive Spectrum
+scope, just picking one of four shapes instead of one shared wiggle.
+During playback, keys 1-5 select: safe/static, scopes, slow border, scopes
+plus border, and slow demo mode (modes 4 and 5 currently look the same,
+since the old background-colour pulse in mode 5 has no visible effect once
+the screen is bitmap). The scope animation follows each oscillator's gate,
+frequency and waveform while colour changes remain deliberately slow.
 
 This is an automatic chip-music arrangement, not a transparent reproduction of
 the source MIDI. Dense chords must be reduced to three voices, and drums borrow
@@ -82,9 +85,10 @@ voice three while they sound.
 - The PRG v1 player combines register deltas with a streaming, 256-byte-window
   LZSS decoder. Very long or modulation-heavy songs can still exceed `$D000`.
 - The oscilloscope bitmap reserves a fixed 8000-byte VIC-II bitmap at
-  `$2000-$3F3F` (forced by hardware alignment), so the packed song event
-  budget is smaller than before: roughly 37 KB (`$3F40-$CFFF`) instead of the
-  old ~50 KB single contiguous region.
+  `$2000-$3F3F` (forced by hardware alignment), plus ~6.1KB for the four
+  waveform-shape (triangle/saw/pulse/noise) picture sets right after it, so
+  the packed song event budget is smaller than before: roughly 30 KB instead
+  of the old ~50 KB single contiguous region.
 - The first tempo event is honoured; mid-song tempo changes are planned.
 - PAL is the default. NTSC changes the SID clock and raster update point.
 - Image conversion (JPG/PNG artwork behind the scope, like MIDI2AY's title

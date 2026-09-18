@@ -236,9 +236,10 @@ class PrgTests(unittest.TestCase):
             data = output.read_bytes()
         self.assertIn(bytes(build_prg.screen_code(ch) for ch in "1 SAFE  2 SCOPE"), data)
         self.assertIn(bytes(build_prg.screen_code(ch) for ch in "BASS/DRUM"), data)
-        # The oscilloscope is real bitmap pixels now (a shared travelling
-        # triangle-wave picture, MIDI2AY-style), not PETSCII characters.
-        self.assertIn(build_prg._wave_phase_bytes(0), data)
+        # The oscilloscope is real bitmap pixels now (a shared, phase-cycling
+        # picture per waveform shape, MIDI2AY-style), not PETSCII characters.
+        for _, row_fn in build_prg.WAVEFORMS:
+            self.assertIn(build_prg._wave_phase_bytes(row_fn, 0), data)
         # VIC-II hi-res bitmap mode gets switched on: LDA #$3B; STA $D011
         # (BMM|DEN|RSEL) followed by LDA #$18; STA $D018 (bitmap $2000 /
         # screen $0400).

@@ -37,14 +37,52 @@ def cell_addr(row: int, col: int) -> int:
     return BITMAP_BASE + row * 320 + col * 8
 
 
-def _wave_row(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
+def _wave_row_triangle(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
     offset = (x + phase * (period // phases)) % period
     half = period // 2
     return round(offset / half * 7) if offset < half else round((period - offset) / half * 7)
 
 
-def _wave_phase_bytes(phase: int) -> bytes:
-    """One SCOPE_TRACE_BYTES picture: a travelling triangle-wave line.
+def _wave_row_saw(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
+    offset = (x + phase * (period // phases)) % period
+    return round(offset / period * 7)
+
+
+def _wave_row_pulse(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
+    offset = (x + phase * (period // phases)) % period
+    return 1 if offset < period // 2 else 6
+
+
+def _wave_row_noise(x: int, phase: int, **_ignored) -> int:
+    # Real SID noise is an LFSR, not reproducible cheaply here; this is a
+    # deterministic pseudo-random "static" trace (a hash of position and
+    # phase, not a real RNG) that still animates but reads as chaotic
+    # rather than a clean tone, which is the point.
+    seed = (x * 2654435761 + phase * 40503) & 0xffffffff
+    seed ^= seed >> 15
+    return seed % 8
+
+
+# SID control-register waveform bit -> its own travelling trace shape, so
+# the scope shows what each voice is actually synthesising (a bright square
+# wave for a pulse patch, a smooth ramp for a triangle lead, a jagged trace
+# for a noise drum hit) instead of one generic wiggle for every voice.
+WAVEFORMS = (
+    (0x10, _wave_row_triangle),  # TRIANGLE
+    (0x20, _wave_row_saw),       # SAWTOOTH
+    (0x40, _wave_row_pulse),     # PULSE
+    (0x80, _wave_row_noise),     # NOISE
+)
+# Maps (control >> 4), i.e. the waveform nibble, to an index into WAVEFORMS.
+# Only single-bit waveforms are given a real shape (every MIDI2SID patch
+# uses exactly one); an unset or combined nibble falls back to triangle.
+WAVE_INDEX_FOR_NIBBLE = [0] * 16
+for _wf_index, (_bit, _fn) in enumerate(WAVEFORMS):
+    WAVE_INDEX_FOR_NIBBLE[_bit >> 4] = _wf_index
+
+
+def _wave_phase_bytes(row_fn, phase: int) -> bytes:
+    """One SCOPE_TRACE_BYTES picture: a travelling waveform-shaped line.
 
     Same shared-waveform idea MIDI2AY uses for its Spectrum oscilloscope
     (one phase-cycling picture reused by every channel), reimplemented for
@@ -55,7 +93,7 @@ def _wave_phase_bytes(phase: int) -> bytes:
     for col in range(SCOPE_WIDTH):
         column = bytearray(8)
         for x_in_col in range(8):
-            y = _wave_row(col * 8 + x_in_col, phase)
+            y = row_fn(col * 8 + x_in_col, phase)
             column[y] |= 0x80 >> x_in_col
         out[col * 8:col * 8 + 8] = bytes(column)
     return bytes(out)
@@ -68,7 +106,7 @@ class Assembler:
         self.origin = origin
         self.code = bytearray()
         self.labels: dict[str, int] = {}
-        self.fixups: list[tuple[int, str, str]] = []
+        self.fixups: list[tuple[int, str, str, int]] = []
 
     @property
     def pc(self) -> int:
@@ -89,27 +127,38 @@ class Assembler:
     def absolute(self, opcode: int, address: int | str) -> None:
         self.byte(opcode)
         if isinstance(address, str):
-            self.fixups.append((len(self.code), address, "absolute"))
+            self.fixups.append((len(self.code), address, "absolute", 0))
             self.byte(0, 0)
         else:
             self.byte(address, address >> 8)
 
+    def absolute_plus(self, opcode: int, label: str, offset: int) -> None:
+        """Like absolute(), but the operand is label's address plus offset.
+
+        Used for a two-byte-per-entry pointer table's high-byte column
+        (table+1) when the table's own address isn't known until resolve().
+        """
+        self.byte(opcode)
+        self.fixups.append((len(self.code), label, "absolute", offset))
+        self.byte(0, 0)
+
     def branch(self, opcode: int, label: str) -> None:
         self.byte(opcode)
-        self.fixups.append((len(self.code), label, "relative"))
+        self.fixups.append((len(self.code), label, "relative", 0))
         self.byte(0)
 
     def word_label(self, label: str) -> None:
         """Emit a label's resolved address as two raw data bytes (no opcode)."""
-        self.fixups.append((len(self.code), label, "absolute"))
+        self.fixups.append((len(self.code), label, "absolute", 0))
         self.byte(0, 0)
 
     def resolve(self) -> bytes:
-        for offset, label, kind in self.fixups:
+        for offset, label, kind, extra in self.fixups:
             if label not in self.labels:
                 raise ValueError(f"undefined 6502 label: {label}")
             target = self.labels[label]
             if kind == "absolute":
+                target += extra
                 self.code[offset] = target & 0xff
                 self.code[offset + 1] = target >> 8
             else:
@@ -331,14 +380,8 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     add_text("keys1", "1 SAFE  2 SCOPE  3 BORDER")
     add_text("keys2", "4 BOTH  5 DEMO")
 
-    for phase in range(WAVE_PHASES):
-        assembler.label(f"wave_phase_{phase}")
-        assembler.byte(*_wave_phase_bytes(phase))
-    wave_ptr_lo = assembler.pc
-    assembler.label("wave_ptr_table")
-    for phase in range(WAVE_PHASES):
-        assembler.word_label(f"wave_phase_{phase}")
-    wave_ptr_hi = wave_ptr_lo + 1
+    assembler.label("wave_index_for_nibble")
+    assembler.byte(*WAVE_INDEX_FOR_NIBBLE)
 
     label_rows = {
         "logo": (0, 16), "title": (2, 1),
@@ -524,12 +567,14 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.label("keys_done")
     assembler.imm(0xa9, 0xff); assembler.absolute(0x8d, 0xdc00); assembler.byte(0x60)
 
-    # Each voice's trace is a shared travelling-triangle picture (like
-    # MIDI2AY's WAVE_TABLE) copied wholesale into its bitmap cell row: since
-    # a run of adjacent bitmap columns is one contiguous block (see
-    # cell_addr), the whole SCOPE_TRACE_BYTES trace is a single flat copy,
-    # no per-character addressing needed. Phase still advances at ~12.5 Hz
-    # with the SID frequency high byte nudging its step, exactly as before.
+    # Each voice's trace picks its shape from that voice's own SID control
+    # register: a travelling triangle/saw/pulse/noise picture, so the scope
+    # shows what the voice is actually synthesising rather than one generic
+    # wiggle for everything (see WAVEFORMS). Each shape is still a shared,
+    # phase-cycling picture reused across voices, MIDI2AY WAVE_TABLE-style,
+    # and copying it is one flat block since a run of adjacent bitmap
+    # columns is contiguous (see cell_addr). Phase advances at ~12.5 Hz with
+    # the SID frequency high byte nudging its step, as before.
     assembler.label("draw_scopes")
     for index, (control, frequency_hi, phase, dest) in enumerate(scope_voices):
         assembler.absolute(0xad, control); assembler.imm(0x29, 1)
@@ -543,12 +588,24 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
         assembler.zp(0x65, phase); assembler.imm(0x29, 0x0f)
         assembler.zp(0x85, phase)
         assembler.label(f"scope_render_{index}")
-        assembler.zp(0xa5, phase)
-        assembler.byte(0x0a)                      # ASL A (word index into ptr table)
+        # Waveform nibble (control>>4) -> WAVEFORMS index -> byte offset into
+        # wave_ptr_table (16 phases * 2 bytes = 32 bytes per waveform block).
+        assembler.absolute(0xad, control)
+        for _ in range(4):
+            assembler.byte(0x4a)                  # LSR A (control -> nibble)
         assembler.byte(0xa8)                      # TAY
-        assembler.absolute(0xb9, wave_ptr_lo)     # LDA wave_ptr_table,Y
+        assembler.absolute(0xb9, "wave_index_for_nibble")
+        for _ in range(5):
+            assembler.byte(0x0a)                  # ASL A (index -> index*32)
+        assembler.zp(0x85, zp_tmp)
+        assembler.zp(0xa5, phase)
+        assembler.byte(0x0a)                      # ASL A (phase -> phase*2)
+        assembler.byte(0x18)                      # CLC
+        assembler.zp(0x65, zp_tmp)
+        assembler.byte(0xa8)                      # TAY
+        assembler.absolute(0xb9, "wave_ptr_table")        # LDA wave_ptr_table,Y
         assembler.zp(0x85, zp_src_lo)
-        assembler.absolute(0xb9, wave_ptr_hi)     # LDA wave_ptr_table+1,Y
+        assembler.absolute_plus(0xb9, "wave_ptr_table", 1)  # LDA wave_ptr_table+1,Y
         assembler.zp(0x85, zp_src_hi)
         assembler.imm(0xa0, 0)
         assembler.label(f"scope_copy_{index}")
@@ -654,6 +711,22 @@ def _player(title: str, packed_events: bytes, video: str) -> bytes:
     assembler.byte(*([0] * (BITMAP_BASE - assembler.pc)))
     assembler.label("bitmap")
     assembler.byte(*([0] * BITMAP_SIZE))
+
+    # The four waveform-shape picture sets (WAVE_PHASES phases each) plus
+    # their pointer table live here rather than in the fixed code below
+    # $2000: at 4x the size of the old single shared table they would no
+    # longer fit in that ~6KB budget, but there's ample room in the packed
+    # song event region above the bitmap. draw_scopes reaches these via
+    # label fixups (resolved below), so their exact address doesn't need to
+    # be known until then.
+    for wf_index, (_bit, row_fn) in enumerate(WAVEFORMS):
+        for phase in range(WAVE_PHASES):
+            assembler.label(f"wave_{wf_index}_{phase}")
+            assembler.byte(*_wave_phase_bytes(row_fn, phase))
+    assembler.label("wave_ptr_table")
+    for wf_index in range(len(WAVEFORMS)):
+        for phase in range(WAVE_PHASES):
+            assembler.word_label(f"wave_{wf_index}_{phase}")
 
     assembler.label("events")
     event_address = assembler.pc

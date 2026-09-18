@@ -112,7 +112,44 @@ class BitmapDisplayTests(unittest.TestCase):
     def test_code_fits_below_the_bitmap(self):
         code, labels = _assemble_with_labels()
         self.assertEqual(labels["bitmap"], build_prg.BITMAP_BASE)
-        self.assertEqual(labels["events"], build_prg.BITMAP_BASE + build_prg.BITMAP_SIZE)
+        # The four waveform-shape picture sets + their pointer table live
+        # right after the bitmap, ahead of the variable-length song events.
+        wave_data_bytes = len(build_prg.WAVEFORMS) * build_prg.WAVE_PHASES * (
+            build_prg.SCOPE_TRACE_BYTES + 2
+        )
+        self.assertEqual(
+            labels["events"],
+            build_prg.BITMAP_BASE + build_prg.BITMAP_SIZE + wave_data_bytes,
+        )
+
+    def test_scope_shape_matches_each_voices_own_waveform(self):
+        code, labels = _assemble_with_labels()
+        mem, _ = _boot_memory(code)
+
+        def render(control_byte, freq_hi, phase_zp_addr, control_reg, freq_reg, dest):
+            mem[control_reg] = control_byte
+            mem[freq_reg] = freq_hi
+            mem[phase_zp_addr] = 0
+            mem[0xf3] = 0  # zp_frame: force phase recompute
+            cpu = CPU(mem)
+            return_to = 0x9000
+            cpu.push((return_to - 1) >> 8)
+            cpu.push((return_to - 1) & 0xff)
+            cpu.run(labels["draw_scopes"], max_steps=200_000, stop_at={return_to})
+            return bytes(mem[dest:dest + build_prg.SCOPE_TRACE_BYTES])
+
+        dest1 = build_prg.cell_addr(6, 2)
+        triangle_trace = render(sid_midi.TRIANGLE | 1, 0x20, 0xee, 0xd404, 0xd401, dest1)
+        saw_trace = render(sid_midi.SAW | 1, 0x20, 0xee, 0xd404, 0xd401, dest1)
+        pulse_trace = render(sid_midi.PULSE | 1, 0x20, 0xee, 0xd404, 0xd401, dest1)
+        noise_trace = render(sid_midi.NOISE | 1, 0x20, 0xee, 0xd404, 0xd401, dest1)
+
+        traces = [triangle_trace, saw_trace, pulse_trace, noise_trace]
+        for a in range(len(traces)):
+            for b in range(a + 1, len(traces)):
+                self.assertNotEqual(traces[a], traces[b], "different waveforms drew identical traces")
+        for trace in traces:
+            self.assertTrue(any(trace))
 
 
 if __name__ == "__main__":
