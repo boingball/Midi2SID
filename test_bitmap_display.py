@@ -1,0 +1,119 @@
+"""Regression tests for the VIC-II hi-res bitmap display.
+
+There is no C64 emulator (VICE or otherwise) available to check the
+hand-assembled 6502/VIC-II code visually, so these tests run the generated
+init code through a small pure-Python 6502 interpreter (cpu6502_sim.py) and
+check the resulting memory image directly: that bitmap mode actually gets
+enabled, that each label's glyphs land in the right bitmap cells, and that
+the oscilloscope trace renders real (non-blank) pixels for a gated voice and
+stays blank for a silent one.
+"""
+import unittest
+
+import build_prg
+import sid_midi
+from cpu6502_sim import CPU
+
+
+def _assemble_with_labels(title="Test Song", video="pal"):
+    reg_a = bytearray(25)
+    reg_a[0] = 0
+    reg_a[1] = 0x10
+    reg_a[4] = sid_midi.TRIANGLE | sid_midi.GATE
+    frames = [sid_midi.SidFrame(reg_a, 0), sid_midi.SidFrame(bytearray(reg_a), 0)]
+    packed = build_prg.pack_lzss(build_prg.encode_events(frames))
+
+    captured = {}
+    original_resolve = build_prg.Assembler.resolve
+
+    def resolve(self):
+        captured["labels"] = dict(self.labels)
+        return original_resolve(self)
+
+    build_prg.Assembler.resolve = resolve
+    try:
+        code = build_prg._player(title, packed, video)
+    finally:
+        build_prg.Assembler.resolve = original_resolve
+    return code, captured["labels"]
+
+
+def _boot_memory(code, fake_rom=True):
+    mem = bytearray(65536)
+    mem[build_prg.ENTRY_ADDRESS:build_prg.ENTRY_ADDRESS + len(code)] = code
+    if fake_rom:
+        # Each glyph's 8 bytes are its own screencode, repeated: lets tests
+        # verify addressing (right glyph -> right cell) without needing a
+        # real character ROM dump.
+        for screencode in range(256):
+            base = 0xd000 + screencode * 8
+            for row in range(8):
+                mem[base + row] = screencode
+    writes = []
+    cpu = CPU(mem)
+    cpu.io_hook = lambda addr, value: writes.append((addr, value))
+    try:
+        cpu.run(build_prg.ENTRY_ADDRESS, max_steps=500_000)
+    except RuntimeError:
+        pass  # expected: the raster-wait loop spins forever with no real VIC
+    return mem, writes
+
+
+class BitmapDisplayTests(unittest.TestCase):
+    def test_boot_enables_hires_bitmap_mode_and_restores_io(self):
+        code, _ = _assemble_with_labels()
+        _, writes = _boot_memory(code)
+        self.assertIn((0xd011, 0x3b), writes)   # BMM|DEN|RSEL, bitmap on
+        self.assertIn((0xd018, 0x18), writes)   # bitmap $2000 / screen $0400
+        self.assertEqual(writes[0], (0x01, 0x31))  # char ROM banked in first
+        self.assertIn((0x01, 0x35), writes[1:])    # and I/O restored after
+
+    def test_labels_blit_to_the_right_bitmap_cells(self):
+        code, _ = _assemble_with_labels(title="Test Song")
+        mem, _ = _boot_memory(code)
+        placements = {
+            "MIDI2SID": (0, 16),
+            "TEST SONG": (2, 1),
+            "LEAD": (5, 2),
+            "BACKING": (9, 2),
+            "BASS/DRUM": (13, 2),
+        }
+        for text, (row, col) in placements.items():
+            for i, ch in enumerate(text):
+                dest = build_prg.cell_addr(row, col + i)
+                expected = bytes([build_prg.screen_code(ch)] * 8)
+                self.assertEqual(
+                    mem[dest:dest + 8], expected,
+                    f"{text!r} char {i} ({ch!r}) not at row {row} col {col + i}",
+                )
+
+    def test_scope_draws_pixels_for_a_gated_voice_and_blanks_a_silent_one(self):
+        code, labels = _assemble_with_labels()
+        mem, _ = _boot_memory(code)
+        mem[0xd404] = sid_midi.TRIANGLE | 1  # voice 1 gated on
+        mem[0xd401] = 0x20
+        mem[0xd40b] = 0  # voice 2 gate off
+        mem[0xd412] = 0  # voice 3 gate off
+        mem[0xf3] = 0    # zp_frame: force a phase recompute this call
+
+        cpu = CPU(mem)
+        return_to = 0x9000
+        cpu.push((return_to - 1) >> 8)
+        cpu.push((return_to - 1) & 0xff)
+        cpu.run(labels["draw_scopes"], max_steps=200_000, stop_at={return_to})
+
+        dest1 = build_prg.cell_addr(6, 2)
+        dest2 = build_prg.cell_addr(10, 2)
+        dest3 = build_prg.cell_addr(14, 2)
+        self.assertTrue(any(mem[dest1:dest1 + build_prg.SCOPE_TRACE_BYTES]))
+        self.assertFalse(any(mem[dest2:dest2 + build_prg.SCOPE_TRACE_BYTES]))
+        self.assertFalse(any(mem[dest3:dest3 + build_prg.SCOPE_TRACE_BYTES]))
+
+    def test_code_fits_below_the_bitmap(self):
+        code, labels = _assemble_with_labels()
+        self.assertEqual(labels["bitmap"], build_prg.BITMAP_BASE)
+        self.assertEqual(labels["events"], build_prg.BITMAP_BASE + build_prg.BITMAP_SIZE)
+
+
+if __name__ == "__main__":
+    unittest.main()

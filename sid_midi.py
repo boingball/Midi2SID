@@ -395,20 +395,35 @@ def _patch_registers(
 DRUM_PRIORITY = {
     38: 100, 40: 98, 39: 96, 35: 94, 36: 94, 54: 90,
     42: 88, 44: 87, 46: 86, 49: 82, 57: 82,
+    37: 90, 53: 75, 60: 70, 61: 70, 62: 70, 63: 70, 64: 70,
+    65: 70, 66: 70, 67: 65, 68: 65, 58: 60, 73: 60, 74: 60,
 }
+
+# Hand drums (bongo/conga/timbale) and cuica are pitched membranophones like
+# the toms, just without their own General MIDI tom pitch spread, so they
+# share the toms' "pulse tuned down an octave, sharpening as it decays" shape.
+_HAND_DRUMS = (60, 61, 62, 63, 64, 65, 66, 78, 79)
+# Metallic/bell percussion and the two whistles are steady pitched tones at
+# their own GM note, the same treatment already used for cowbell/claves/
+# woodblocks/triangle.
+_BELL_TONES = (53, 56, 67, 68, 71, 72, 75, 76, 77, 80, 81)
+# A scrape or rattle: longer than a hi-hat tick, shorter than a cymbal wash.
+_SCRAPE_NOISE = (58, 73, 74)
 
 
 def _drum_registers(note: Note, age: int, clock: int) -> list[int]:
     pitch = note.pitch
     if pitch in (35, 36):
         waveform, musical_pitch, decay = TRIANGLE, 36 - min(age, 3) * 5, 5
-    elif pitch in (41, 43, 45, 47, 48, 50):
+    elif pitch in (41, 43, 45, 47, 48, 50) or pitch in _HAND_DRUMS:
         waveform, musical_pitch, decay = PULSE, pitch - 12 - min(age, 2) * 2, 6
-    elif pitch in (56, 75, 76, 77, 80, 81):
+    elif pitch in _BELL_TONES:
         waveform, musical_pitch, decay = PULSE, pitch, 5
+    elif pitch in _SCRAPE_NOISE:
+        waveform, musical_pitch, decay = NOISE, max(24, min(96, pitch + 18)), 4
     else:
         waveform, musical_pitch = NOISE, max(24, min(96, pitch + 18))
-        decay = 2 if pitch in (42, 44, 54, 69, 70) else 6
+        decay = 2 if pitch in (37, 42, 44, 54, 69, 70) else 6
     frequency = sid_frequency(musical_pitch, clock)
     # A high sustain level makes short noise hits stick at full volume until
     # GATE drops, which is heard as loud clicks or bursts of continuous noise.
@@ -423,13 +438,13 @@ def _drum_registers(note: Note, age: int, clock: int) -> list[int]:
 
 def _drum_tail(pitch: int) -> int:
     """Return a short, bass-friendly percussion lifetime in video frames."""
-    if pitch in (42, 44, 46, 54, 69, 70):       # hats, tambourine, shakers
+    if pitch in (37, 42, 44, 46, 54, 69, 70):   # side stick, hats, tambourine, shakers
         return 1
     if pitch in (49, 51, 52, 55, 57, 59):       # cymbals
         return 3
-    if pitch in (41, 43, 45, 47, 48, 50):       # toms
+    if pitch in (41, 43, 45, 47, 48, 50) or pitch in _HAND_DRUMS:  # toms, bongo/conga/timbale, cuica
         return 3
-    return 2                                    # kick, snare and other hits
+    return 2                                    # kick, snare, bells and other hits
 
 
 def _first_tempo(tempos: list[tuple[int, int]]) -> int:

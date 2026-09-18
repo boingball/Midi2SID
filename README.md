@@ -6,7 +6,10 @@ in [MIDI2AY](https://github.com/boingball/Midi2AY).
 MIDI2SID reads format 0/1 PPQN Standard MIDI files and creates a self-running
 C64 `.prg`. It automatically reduces polyphonic arrangements to the SID's three
 voices, maps all 128 General MIDI programs to SID synth families, and gives MIDI
-channel 10 a dedicated synthesized drum path.
+channel 10 a dedicated synthesized drum path with distinct tuned or noise
+treatment for kicks, snares, toms, hats, cymbals, cowbell/claves/woodblocks/
+triangle, bongos/congas/timbales/cuica, agogo/ride bell, and guiro/vibraslap;
+anything else on channel 10 still falls back to generic noise.
 
 Before rendering individual frames, the arranger scores each non-drum MIDI
 channel across the complete song to identify its likely melody. SID voice one
@@ -58,11 +61,17 @@ automatic conversions. `--feel expressive` restores animated PWM and the slower
 family-specific attack/release values for files arranged around sustained pads
 and strings.
 
-The generated player starts in visual mode 2, showing three pitch-reactive SID
-traces for lead, backing and bass/drums. During playback, keys 1-5 select:
-safe/static, scopes, slow border, scopes plus border, and slow demo mode. The
-scope animation follows each oscillator's gate and frequency while colour changes
-remain deliberately slow.
+The generated player starts in visual mode 2. The whole screen is a real
+VIC-II hi-res bitmap (not text mode): the title and labels are blitted from
+the real character ROM at boot, and each SID voice gets a genuine travelling
+pixel oscilloscope trace (a shared triangle-wave picture reused per voice,
+the same idea as the pitch-reactive scope in
+[MIDI2AY](https://github.com/boingball/Midi2AY)) instead of PETSCII
+characters. During playback, keys 1-5 select: safe/static, scopes, slow
+border, scopes plus border, and slow demo mode (modes 4 and 5 currently look
+the same, since the old background-colour pulse in mode 5 has no visible
+effect once the screen is bitmap). The scope animation follows each
+oscillator's gate and frequency while colour changes remain deliberately slow.
 
 This is an automatic chip-music arrangement, not a transparent reproduction of
 the source MIDI. Dense chords must be reduced to three voices, and drums borrow
@@ -72,10 +81,15 @@ voice three while they sound.
 
 - The PRG v1 player combines register deltas with a streaming, 256-byte-window
   LZSS decoder. Very long or modulation-heavy songs can still exceed `$D000`.
+- The oscilloscope bitmap reserves a fixed 8000-byte VIC-II bitmap at
+  `$2000-$3F3F` (forced by hardware alignment), so the packed song event
+  budget is smaller than before: roughly 37 KB (`$3F40-$CFFF`) instead of the
+  old ~50 KB single contiguous region.
 - The first tempo event is honoured; mid-song tempo changes are planned.
 - PAL is the default. NTSC changes the SID clock and raster update point.
-- Image conversion, PSID export, keyboard effects and packed pattern data are
-  planned follow-up features.
+- Image conversion (JPG/PNG artwork behind the scope, like MIDI2AY's title
+  card), PSID export, keyboard effects and packed pattern data are planned
+  follow-up features.
 
 ## Tests
 

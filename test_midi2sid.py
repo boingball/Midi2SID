@@ -153,6 +153,25 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertTrue(frame[18] & sid_midi.GATE)
         self.assertEqual(frame[20] >> 4, 0)
 
+    def test_congas_and_bongos_get_tuned_pulse_not_generic_noise(self):
+        # Latin GM drum kits lean heavily on 60-66/78-79; previously anything
+        # outside the tom/kick/snare/cymbal lists collapsed to flat noise.
+        for pitch in (60, 62, 64, 65, 78):
+            registers = sid_midi._drum_registers(sid_midi.Note(0, 2, pitch, 100, 9, 0), 0, sid_midi.PAL_SID_CLOCK)
+            self.assertEqual(registers[4] & 0xf0, sid_midi.PULSE)
+
+    def test_agogo_and_ride_bell_are_tuned_like_cowbell(self):
+        for pitch in (53, 67, 68):
+            registers = sid_midi._drum_registers(sid_midi.Note(0, 2, pitch, 100, 9, 0), 0, sid_midi.PAL_SID_CLOCK)
+            self.assertEqual(registers[4] & 0xf0, sid_midi.PULSE)
+            self.assertEqual(sid_midi.sid_frequency(pitch), registers[0] | (registers[1] << 8))
+
+    def test_guiro_and_vibraslap_are_noise_not_default_decay(self):
+        for pitch in (58, 73, 74):
+            registers = sid_midi._drum_registers(sid_midi.Note(0, 2, pitch, 100, 9, 0), 0, sid_midi.PAL_SID_CLOCK)
+            self.assertEqual(registers[4] & 0xf0, sid_midi.NOISE)
+            self.assertEqual(registers[5], 4)
+
     def test_filter_is_off_by_default(self):
         note = sid_midi.Note(0, 96, 60, 100, 0, 32)
         frames = sid_midi.frames_for([note], 96)
@@ -216,8 +235,15 @@ class PrgTests(unittest.TestCase):
             build_prg.build_prg([frame], output, "SCOPE")
             data = output.read_bytes()
         self.assertIn(bytes(build_prg.screen_code(ch) for ch in "1 SAFE  2 SCOPE"), data)
-        self.assertIn(bytes(build_prg.screen_code(ch) for ch in "..-->>>--..<<<--"), data)
         self.assertIn(bytes(build_prg.screen_code(ch) for ch in "BASS/DRUM"), data)
+        # The oscilloscope is real bitmap pixels now (a shared travelling
+        # triangle-wave picture, MIDI2AY-style), not PETSCII characters.
+        self.assertIn(build_prg._wave_phase_bytes(0), data)
+        # VIC-II hi-res bitmap mode gets switched on: LDA #$3B; STA $D011
+        # (BMM|DEN|RSEL) followed by LDA #$18; STA $D018 (bitmap $2000 /
+        # screen $0400).
+        self.assertIn(bytes((0xa9, 0x3b, 0x8d, 0x11, 0xd0)), data)
+        self.assertIn(bytes((0xa9, 0x18, 0x8d, 0x18, 0xd0)), data)
 
     def test_bad_frame_size_is_rejected(self):
         with self.assertRaises(ValueError):
