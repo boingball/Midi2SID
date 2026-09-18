@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 
 import build_prg
@@ -83,6 +84,71 @@ class SidSynthesisTests(unittest.TestCase):
         )
         self.assertIsNotNone(voices[0])
 
+    def test_reserve_lead_allows_fallback_during_a_long_lead_absence(self):
+        # A synth lead riff (channel 5) that only plays briefly at the start
+        # and end of a song, with a guitar solo (channel 7) filling a long
+        # middle stretch, reproduces a real full-band arrangement: the lead
+        # channel is still correctly identified as the song's melody, but
+        # voice one must not go silent for the whole gap where it isn't
+        # playing while good fallback material is available. Reserving the
+        # full first-note-to-last-note span (rather than just the lead's own
+        # notes and short rests between them) silenced voice one for the
+        # entire solo instead of falling back to it.
+        lead_notes = [
+            sid_midi.Note(0, 40, 76, 110, 5, 80),
+            sid_midi.Note(40, 100, 79, 110, 5, 80),
+            sid_midi.Note(3000, 3040, 76, 110, 5, 80),
+            sid_midi.Note(3040, 3100, 79, 110, 5, 80),
+        ]
+        solo_notes = [
+            sid_midi.Note(start, start + 90, 60 + (start // 100) % 5, 100, 7, 30)
+            for start in range(1000, 2000, 100)
+        ]
+        notes = lead_notes + solo_notes
+        self.assertEqual(sid_midi._select_lead_channel(notes), 5)
+        frames = sid_midi.frames_for(notes, 120, tempos=[(0, 500_000)])
+        mid_tick = 1500
+        tempo = 500_000
+        ticks_per_frame = Fraction(120 * 1_000_000, tempo * 50)
+        mid_frame = mid_tick * ticks_per_frame.denominator // ticks_per_frame.numerator
+        self.assertTrue(
+            frames[mid_frame][4] & sid_midi.GATE,
+            "voice one went silent during the guitar solo instead of falling back",
+        )
+
+    def test_secondary_lead_wins_intro_over_loud_backing_chords(self):
+        # A song whose main lead (channel 5, a real GM lead patch) only plays
+        # late, with a staccato brass riff (channel 2) carrying an intro that
+        # loud, sustained ensemble backing chords (channel 3) overlap: this
+        # reproduces "The Final Countdown"'s intro, where the generic
+        # per-frame fallback let the backing chords outscore and replace the
+        # actual intro melody on voice one every other bar.
+        primary_notes = [
+            sid_midi.Note(5000 + i * 100, 5000 + i * 100 + 90, 72, 110, 5, 80)
+            for i in range(20)
+        ]
+        secondary_notes = [
+            sid_midi.Note(i * 100, i * 100 + 40, 70, 110, 2, 61) for i in range(10)
+        ]
+        backing_notes = [
+            sid_midi.Note(i * 100, i * 100 + 100, pitch, 100, 3, 50)
+            for i in range(10) for pitch in (60, 64, 67)
+        ]
+        notes = primary_notes + secondary_notes + backing_notes
+        primary = sid_midi._select_lead_channel(notes)
+        self.assertEqual(primary, 5)
+        self.assertEqual(sid_midi._select_secondary_lead_channel(notes, primary), 2)
+
+        frames = sid_midi.frames_for(notes, 120, tempos=[(0, 500_000)])
+        tempo = 500_000
+        ticks_per_frame = Fraction(120 * 1_000_000, tempo * 50)
+        num, den = ticks_per_frame.numerator, ticks_per_frame.denominator
+        for tick in range(0, 40, 4):  # inside the riff's first note, 0-40
+            frame = tick * den // num
+            control = frames[frame][4]
+            if control & sid_midi.GATE:
+                self.assertEqual(control & 0xf0, sid_midi.PATCHES["brass"].waveform)
+
     def test_pipe_patch_is_bright_pulse_lead(self):
         self.assertEqual(sid_midi.PATCHES["pipe"].waveform, sid_midi.PULSE)
         self.assertGreaterEqual(sid_midi.PATCHES["pipe"].sustain, 12)
@@ -153,6 +219,25 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertTrue(frame[18] & sid_midi.GATE)
         self.assertEqual(frame[20] >> 4, 0)
 
+    def test_congas_and_bongos_get_tuned_pulse_not_generic_noise(self):
+        # Latin GM drum kits lean heavily on 60-66/78-79; previously anything
+        # outside the tom/kick/snare/cymbal lists collapsed to flat noise.
+        for pitch in (60, 62, 64, 65, 78):
+            registers = sid_midi._drum_registers(sid_midi.Note(0, 2, pitch, 100, 9, 0), 0, sid_midi.PAL_SID_CLOCK)
+            self.assertEqual(registers[4] & 0xf0, sid_midi.PULSE)
+
+    def test_agogo_and_ride_bell_are_tuned_like_cowbell(self):
+        for pitch in (53, 67, 68):
+            registers = sid_midi._drum_registers(sid_midi.Note(0, 2, pitch, 100, 9, 0), 0, sid_midi.PAL_SID_CLOCK)
+            self.assertEqual(registers[4] & 0xf0, sid_midi.PULSE)
+            self.assertEqual(sid_midi.sid_frequency(pitch), registers[0] | (registers[1] << 8))
+
+    def test_guiro_and_vibraslap_are_noise_not_default_decay(self):
+        for pitch in (58, 73, 74):
+            registers = sid_midi._drum_registers(sid_midi.Note(0, 2, pitch, 100, 9, 0), 0, sid_midi.PAL_SID_CLOCK)
+            self.assertEqual(registers[4] & 0xf0, sid_midi.NOISE)
+            self.assertEqual(registers[5], 4)
+
     def test_filter_is_off_by_default(self):
         note = sid_midi.Note(0, 96, 60, 100, 0, 32)
         frames = sid_midi.frames_for([note], 96)
@@ -216,8 +301,16 @@ class PrgTests(unittest.TestCase):
             build_prg.build_prg([frame], output, "SCOPE")
             data = output.read_bytes()
         self.assertIn(bytes(build_prg.screen_code(ch) for ch in "1 SAFE  2 SCOPE"), data)
-        self.assertIn(bytes(build_prg.screen_code(ch) for ch in "..-->>>--..<<<--"), data)
         self.assertIn(bytes(build_prg.screen_code(ch) for ch in "BASS/DRUM"), data)
+        # The oscilloscope is real bitmap pixels now (a shared, phase-cycling
+        # picture per waveform shape, MIDI2AY-style), not PETSCII characters.
+        for _, row_fn in build_prg.WAVEFORMS:
+            self.assertIn(build_prg._wave_phase_bytes(row_fn, 0), data)
+        # VIC-II hi-res bitmap mode gets switched on: LDA #$3B; STA $D011
+        # (BMM|DEN|RSEL) followed by LDA #$18; STA $D018 (bitmap $2000 /
+        # screen $0400).
+        self.assertIn(bytes((0xa9, 0x3b, 0x8d, 0x11, 0xd0)), data)
+        self.assertIn(bytes((0xa9, 0x18, 0x8d, 0x18, 0xd0)), data)
 
     def test_bad_frame_size_is_rejected(self):
         with self.assertRaises(ValueError):
