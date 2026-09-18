@@ -262,7 +262,7 @@ def _select_lead_channel(notes: list[Note]) -> int | None:
 def _choose_voices(
     tones: list[Note], previous_lead: tuple[int, int] | int | None = None,
     previous_middle: tuple[int, int] | int | None = None,
-    lead_channel: int | None = None,
+    lead_channel: int | None = None, reserve_lead: bool = False,
 ) -> tuple[list[Note | None], tuple[int, int] | None, tuple[int, int] | None]:
     """Choose stable lead, restrained accompaniment and bass SID voices."""
     unique: dict[tuple[int, int], Note] = {}
@@ -292,14 +292,25 @@ def _choose_voices(
             + continuity
         )
 
-    lead = max(preferred or pool, key=lead_score)
-    lead_key = lead.channel, lead.pitch
+    # Once the selected melody has started, reserve SID voice one for it.
+    # Letting a short arpeggio/effect jump into the gaps chops off the lead's
+    # SID release and makes the accompaniment appear to fight the tune. Intro
+    # and outro material can still use voice one outside the melody window.
+    if preferred:
+        lead = max(preferred, key=lead_score)
+    elif reserve_lead and lead_channel is not None:
+        lead = None
+    else:
+        lead = max(pool, key=lead_score)
+    lead_key = (lead.channel, lead.pitch) if lead is not None else None
 
     # Prefer an actual GM bass channel for voice three. Falling back to the
     # lowest remaining pitch keeps the old two-note lead/bass behaviour.
     remaining = [
         note for note in pool
-        if (note.channel, note.pitch) != lead_key and note.pitch != lead.pitch
+        if lead is None or (
+            (note.channel, note.pitch) != lead_key and note.pitch != lead.pitch
+        )
     ]
     bass_candidates = [note for note in remaining if family(note.program) == "bass"]
     bass_pool = bass_candidates or remaining
@@ -320,7 +331,7 @@ def _choose_voices(
             + min(note.end - note.start, 480)
             + note.velocity
             + continuity
-            - abs(note.pitch - lead.pitch)
+            - (abs(note.pitch - lead.pitch) if lead is not None else 0)
         )
 
     middle = max(accompaniment, key=middle_score) if accompaniment else None
@@ -353,7 +364,10 @@ def _patch_registers(
         # vibrato. Animated PWM remains available in expressive mode: restarting
         # it on every short note makes dense automatic reductions sound untidy.
         attack = 0
-        release = min(patch.release, 2)
+        # Voice one benefits from one extra SID release step. Previously every
+        # tight-mode voice was capped at 2, which made staccato melody patches
+        # such as Popcorn's pipe lead end more abruptly than their patch asks.
+        release = min(patch.release, 3 if voice == 0 else 2)
         velocity_scale = 0.65 + 0.35 * note.velocity / 127
     else:
         attack = patch.attack
@@ -449,6 +463,13 @@ def frames_for(
     previous_lead = previous_middle = None
     previous_sources: list[tuple | None] = [None, None, None]
     lead_channel = _select_lead_channel(notes)
+    lead_notes = [note for note in notes if note.channel == lead_channel]
+    lead_start = min((note.start for note in lead_notes), default=None)
+    lead_end = max((note.end for note in lead_notes), default=None)
+    # Keep the last melodic oscillator/ADSR setup so a note-off frame can clear
+    # GATE without also destroying waveform and release. The SID envelope then
+    # gets to perform the release phase naturally until the next note arrives.
+    last_tone_registers: list[list[int] | None] = [None, None, None]
 
     for frame in range(total):
         # Keep the MIDI clock fractional. Rounding 5.28 ticks/frame to 5 made
@@ -462,20 +483,32 @@ def frames_for(
             and n.start * tick_denominator < end_tick_scaled
             and n.end * tick_denominator > start_tick_scaled
         ]
+        reserve_lead = (
+            lead_start is not None and lead_end is not None
+            and end_tick_scaled > lead_start * tick_denominator
+            and start_tick_scaled < lead_end * tick_denominator
+        )
         voices, previous_lead, previous_middle = _choose_voices(
-            live_tones, previous_lead, previous_middle, lead_channel=lead_channel
+            live_tones, previous_lead, previous_middle,
+            lead_channel=lead_channel, reserve_lead=reserve_lead,
         )
         if not live_tones:
             previous_lead = previous_middle = None
         registers = [0] * 25
         for voice, note in enumerate(voices):
+            base = voice * 7
             if note is None:
+                previous = last_tone_registers[voice]
+                if previous is not None:
+                    release_registers = list(previous)
+                    release_registers[4] &= ~GATE
+                    registers[base:base + 7] = release_registers
                 continue
             onset_frame = note.start * tick_denominator // tick_numerator
             age = max(0, frame - onset_frame)
-            registers[voice * 7:voice * 7 + 7] = _patch_registers(
-                note, age, voice, clock, feel=feel
-            )
+            tone_registers = _patch_registers(note, age, voice, clock, feel=feel)
+            registers[base:base + 7] = tone_registers
+            last_tone_registers[voice] = tone_registers
 
         sources: list[tuple | None] = [
             ("tone", note.start, note.end, note.pitch, note.channel, note.program)

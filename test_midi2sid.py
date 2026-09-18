@@ -62,6 +62,27 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertEqual(voices[2].channel, 0)
         self.assertIsNone(voices[1])
 
+    def test_reserved_lead_voice_rejects_arpeggio_during_melody_gap(self):
+        notes = [
+            sid_midi.Note(120, 132, 96, 127, 2, 102),
+            sid_midi.Note(100, 180, 40, 104, 0, 35),
+        ]
+        voices, _, _ = sid_midi._choose_voices(
+            notes, lead_channel=5, reserve_lead=True
+        )
+        self.assertIsNone(voices[0])
+        self.assertEqual(voices[2].channel, 0)
+
+    def test_lead_voice_fallback_remains_available_outside_melody_window(self):
+        notes = [
+            sid_midi.Note(0, 120, 72, 100, 6, 17),
+            sid_midi.Note(0, 120, 40, 100, 0, 35),
+        ]
+        voices, _, _ = sid_midi._choose_voices(
+            notes, lead_channel=5, reserve_lead=False
+        )
+        self.assertIsNotNone(voices[0])
+
     def test_pipe_patch_is_bright_pulse_lead(self):
         self.assertEqual(sid_midi.PATCHES["pipe"].waveform, sid_midi.PULSE)
         self.assertGreaterEqual(sid_midi.PATCHES["pipe"].sustain, 12)
@@ -82,6 +103,16 @@ class SidSynthesisTests(unittest.TestCase):
         self.assertEqual(tight[5] >> 4, 0)
         self.assertEqual(expressive[5] >> 4, sid_midi.PATCHES["ensemble"].attack)
         self.assertGreater(tight[6] >> 4, expressive[6] >> 4)
+
+    def test_note_off_preserves_waveform_and_sid_release(self):
+        note = sid_midi.Note(0, 12, 83, 112, 5, 79)
+        frames = sid_midi.frames_for([note], 96, feel="tight")
+        gated = [index for index, frame in enumerate(frames) if frame[4] & sid_midi.GATE]
+        self.assertTrue(gated)
+        release_frame = frames[gated[-1] + 1]
+        self.assertEqual(release_frame[4] & sid_midi.GATE, 0)
+        self.assertTrue(release_frame[4] & sid_midi.PULSE)
+        self.assertEqual(release_frame[6] & 0x0f, 3)
 
     def test_tight_feel_keeps_pulse_width_stable(self):
         note = sid_midi.Note(0, 960, 60, 100, 0, 0)
