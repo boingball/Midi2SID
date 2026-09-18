@@ -259,6 +259,95 @@ def _select_lead_channel(notes: list[Note]) -> int | None:
     return max(scored)[3]
 
 
+# Families strong enough to plausibly carry a song's melody on their own,
+# reusing _select_lead_channel's own score table (lead/pipe/reed/brass all
+# score >=500 there). Restricting the secondary lead pick to these keeps
+# heavily-scored backing parts (ensembles, pads, organs, rhythm guitars) from
+# ever qualifying just because they are busy or high-pitched.
+_STRONG_LEAD_FAMILIES = frozenset(
+    family_name for family_name, score in LEAD_FAMILY_SCORE.items() if score >= 500
+)
+
+
+def _select_secondary_lead_channel(notes: list[Note], primary: int | None) -> int | None:
+    """Find a second channel that also plausibly carries the melody elsewhere.
+
+    A full-band arrangement often gives an intro or bridge its own solo
+    voice on a different patch than the song's main lead (e.g. a brass-patch
+    riff before a synth lead takes over): reserving only the single top-
+    scoring channel left voice one with no good candidate during that
+    section, falling back to whichever chord/pad note briefly scored highest
+    that frame and sounding like backing material fighting for the lead.
+    Restricted to the same strong "solo" GM families as the primary channel
+    and to a real runner-up score, so a busy accompaniment part never
+    qualifies just from note count or pitch.
+    """
+    channels: dict[int, list[Note]] = defaultdict(list)
+    for note in notes:
+        if note.channel != 9 and note.channel != primary:
+            channels[note.channel].append(note)
+    if not channels:
+        return None
+    song_end = max(note.end for channel_notes in channels.values() for note in channel_notes)
+    best_score = float("-inf")
+    best_channel = None
+    for channel, channel_notes in channels.items():
+        family_counts: dict[str, int] = defaultdict(int)
+        for note in channel_notes:
+            family_counts[family(note.program)] += 1
+        dominant_family = max(family_counts, key=family_counts.get)
+        if dominant_family not in _STRONG_LEAD_FAMILIES:
+            continue
+        count = len(channel_notes)
+        average_pitch = sum(note.pitch for note in channel_notes) / count
+        average_velocity = sum(note.velocity for note in channel_notes) / count
+        activity = _coverage(channel_notes) / max(1, song_end)
+        polyphony_penalty = max(0, _max_polyphony(channel_notes) - 1) * 100
+        score = (
+            LEAD_FAMILY_SCORE.get(dominant_family, 0)
+            + min(count, 256) * 2
+            + average_pitch * 4
+            + average_velocity * 2
+            + min(1.0, activity) * 300
+            - polyphony_penalty
+        )
+        if score > best_score:
+            best_score, best_channel = score, channel
+    return best_channel if best_score >= 500 else None
+
+
+def _merged_lead_intervals(channel_notes: list[Note], division: int) -> list[tuple[int, int]]:
+    """Merge a channel's own notes into (start, end) spans, bridging rests of
+    a bar (4 beats) or less. Reserving voice one only within these spans
+    blocks a busy arpeggio from stealing a brief breath without silencing
+    voice one across a whole section where the channel genuinely isn't
+    playing (see frames_for).
+    """
+    intervals: list[tuple[int, int]] = []
+    if not channel_notes:
+        return intervals
+    ordered = sorted(channel_notes, key=lambda note: note.start)
+    max_gap = max(1, division * 4)
+    interval_start = ordered[0].start
+    interval_end = ordered[0].end
+    for note in ordered[1:]:
+        if note.start - interval_end > max_gap:
+            intervals.append((interval_start, interval_end))
+            interval_start = note.start
+        interval_end = max(interval_end, note.end)
+    intervals.append((interval_start, interval_end))
+    return intervals
+
+
+def _frame_in_intervals(
+    intervals: list[tuple[int, int]], start_scaled: int, end_scaled: int, denominator: int,
+) -> bool:
+    return any(
+        end_scaled > interval_start * denominator and start_scaled < interval_end * denominator
+        for interval_start, interval_end in intervals
+    )
+
+
 def _choose_voices(
     tones: list[Note], previous_lead: tuple[int, int] | int | None = None,
     previous_middle: tuple[int, int] | int | None = None,
@@ -478,26 +567,17 @@ def frames_for(
     previous_lead = previous_middle = None
     previous_sources: list[tuple | None] = [None, None, None]
     lead_channel = _select_lead_channel(notes)
-    lead_notes = sorted((note for note in notes if note.channel == lead_channel), key=lambda n: n.start)
-    # Reserve voice one only across the lead's own notes and short rests
-    # between them, not the whole first-to-last-note span. A real arrangement
-    # often puts the identified lead channel's melody in only some sections
-    # (e.g. a synth riff that sits out an entire guitar solo played on another
-    # channel); reserving the full span silenced voice one for that solo
-    # instead of letting a good fallback candidate play it. A gap longer than
-    # a bar (4 beats) is treated as the lead genuinely handing off, not a
-    # breath, so fallback is allowed again until the lead returns.
-    lead_intervals: list[tuple[int, int]] = []
-    if lead_notes:
-        max_gap = max(1, division * 4)
-        interval_start = lead_notes[0].start
-        interval_end = lead_notes[0].end
-        for note in lead_notes[1:]:
-            if note.start - interval_end > max_gap:
-                lead_intervals.append((interval_start, interval_end))
-                interval_start = note.start
-            interval_end = max(interval_end, note.end)
-        lead_intervals.append((interval_start, interval_end))
+    lead_intervals = _merged_lead_intervals(
+        [note for note in notes if note.channel == lead_channel], division
+    )
+    # A second channel that also carries real melodic material elsewhere
+    # (e.g. an intro riff on a different patch before the main lead takes
+    # over) gets the same reserved-span treatment, so voice one falls back
+    # to it instead of whichever backing chord briefly scores highest.
+    secondary_lead_channel = _select_secondary_lead_channel(notes, lead_channel)
+    secondary_lead_intervals = _merged_lead_intervals(
+        [note for note in notes if note.channel == secondary_lead_channel], division
+    )
     # Keep the last melodic oscillator/ADSR setup so a note-off frame can clear
     # GATE without also destroying waveform and release. The SID envelope then
     # gets to perform the release phase naturally until the next note arrives.
@@ -515,14 +595,15 @@ def frames_for(
             and n.start * tick_denominator < end_tick_scaled
             and n.end * tick_denominator > start_tick_scaled
         ]
-        reserve_lead = any(
-            end_tick_scaled > interval_start * tick_denominator
-            and start_tick_scaled < interval_end * tick_denominator
-            for interval_start, interval_end in lead_intervals
-        )
+        if _frame_in_intervals(lead_intervals, start_tick_scaled, end_tick_scaled, tick_denominator):
+            active_lead_channel, reserve_lead = lead_channel, True
+        elif _frame_in_intervals(secondary_lead_intervals, start_tick_scaled, end_tick_scaled, tick_denominator):
+            active_lead_channel, reserve_lead = secondary_lead_channel, True
+        else:
+            active_lead_channel, reserve_lead = lead_channel, False
         voices, previous_lead, previous_middle = _choose_voices(
             live_tones, previous_lead, previous_middle,
-            lead_channel=lead_channel, reserve_lead=reserve_lead,
+            lead_channel=active_lead_channel, reserve_lead=reserve_lead,
         )
         if not live_tones:
             previous_lead = previous_middle = None

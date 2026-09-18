@@ -116,6 +116,39 @@ class SidSynthesisTests(unittest.TestCase):
             "voice one went silent during the guitar solo instead of falling back",
         )
 
+    def test_secondary_lead_wins_intro_over_loud_backing_chords(self):
+        # A song whose main lead (channel 5, a real GM lead patch) only plays
+        # late, with a staccato brass riff (channel 2) carrying an intro that
+        # loud, sustained ensemble backing chords (channel 3) overlap: this
+        # reproduces "The Final Countdown"'s intro, where the generic
+        # per-frame fallback let the backing chords outscore and replace the
+        # actual intro melody on voice one every other bar.
+        primary_notes = [
+            sid_midi.Note(5000 + i * 100, 5000 + i * 100 + 90, 72, 110, 5, 80)
+            for i in range(20)
+        ]
+        secondary_notes = [
+            sid_midi.Note(i * 100, i * 100 + 40, 70, 110, 2, 61) for i in range(10)
+        ]
+        backing_notes = [
+            sid_midi.Note(i * 100, i * 100 + 100, pitch, 100, 3, 50)
+            for i in range(10) for pitch in (60, 64, 67)
+        ]
+        notes = primary_notes + secondary_notes + backing_notes
+        primary = sid_midi._select_lead_channel(notes)
+        self.assertEqual(primary, 5)
+        self.assertEqual(sid_midi._select_secondary_lead_channel(notes, primary), 2)
+
+        frames = sid_midi.frames_for(notes, 120, tempos=[(0, 500_000)])
+        tempo = 500_000
+        ticks_per_frame = Fraction(120 * 1_000_000, tempo * 50)
+        num, den = ticks_per_frame.numerator, ticks_per_frame.denominator
+        for tick in range(0, 40, 4):  # inside the riff's first note, 0-40
+            frame = tick * den // num
+            control = frames[frame][4]
+            if control & sid_midi.GATE:
+                self.assertEqual(control & 0xf0, sid_midi.PATCHES["brass"].waveform)
+
     def test_pipe_patch_is_bright_pulse_lead(self):
         self.assertEqual(sid_midi.PATCHES["pipe"].waveform, sid_midi.PULSE)
         self.assertGreaterEqual(sid_midi.PATCHES["pipe"].sustain, 12)
