@@ -160,6 +160,31 @@ class BitmapDisplayTests(unittest.TestCase):
         for trace in traces:
             self.assertTrue(any(trace))
 
+    def test_higher_pitched_voice_advances_its_phase_faster(self):
+        # A shift of >>6 on an 8-bit frequency-hi byte left almost every
+        # musically useful note with the same nudge, so all three scope
+        # traces advanced in lockstep regardless of pitch. Confirm a bass
+        # note and a lead note now produce different phase steps.
+        code, labels = _assemble_with_labels()
+        mem, _ = _boot_memory(code)
+
+        def phase_step(freq_hi):
+            mem[0xd404] = sid_midi.TRIANGLE | 1  # voice 1 gated on
+            mem[0xd401] = freq_hi
+            mem[0xee] = 0  # zp_phase1 starts at 0
+            mem[0xf3] = 0  # zp_frame: force a phase recompute this call
+            cpu = CPU(mem)
+            return_to = 0x9000
+            cpu.push((return_to - 1) >> 8)
+            cpu.push((return_to - 1) & 0xff)
+            cpu.run(labels["draw_scopes"], max_steps=200_000, stop_at={return_to})
+            return mem[0xee]
+
+        bass_step = phase_step(4)    # ~MIDI 36
+        lead_step = phase_step(69)   # ~MIDI 84
+        self.assertNotEqual(bass_step, lead_step)
+        self.assertGreater(lead_step, bass_step)
+
 
 if __name__ == "__main__":
     unittest.main()
