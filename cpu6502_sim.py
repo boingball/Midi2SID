@@ -112,11 +112,13 @@ class CPU:
     def run(self, start: int, max_steps: int = 2_000_000, stop_at: set[int] | None = None) -> None:
         self.pc = start
         stop_at = stop_at or set()
-        while self.steps < max_steps:
+        executed = 0
+        while executed < max_steps:
             if self.pc in stop_at:
                 return
             self.step()
-            if self.steps >= max_steps:
+            executed += 1
+            if executed >= max_steps:
                 raise RuntimeError(f"6502 sim exceeded {max_steps} steps (runaway loop?) at pc=${self.pc:04x}")
 
     def step(self) -> None:
