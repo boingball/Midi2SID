@@ -103,20 +103,13 @@ there.
 ## Current limits
 
 - The PRG v1 player combines register deltas with a streaming, 256-byte-window
-  LZSS decoder. `$D000-$DFFF` is VIC/SID/CIA I/O and can never hold data, but
-  the player's own CPU port setting makes `$E000-$FFFF` plain RAM (not
-  KERNAL ROM), so packed events that overflow the low region spill into it
-  automatically - the build only fails once a song is too large even with
-  that extension. A few bytes at the very top are reserved for the 6510
-  hardware vectors (RESTORE still works: it's wired to a safe no-op instead
-  of jamming into arbitrary song data, and RESET restarts the player).
+  LZSS decoder. Very long or modulation-heavy songs can still exceed `$D000`.
 - The oscilloscope bitmap reserves a fixed 8000-byte VIC-II bitmap at
   `$2000-$3F3F` (forced by hardware alignment), plus ~6.1KB for the four
   waveform-shape (triangle/saw/pulse/noise) picture sets right after it, so
-  the packed song event budget is smaller than before the bitmap scope:
-  roughly 30 KB in the low region, plus another ~8KB from the high-RAM
-  extension above, versus the old ~50 KB single contiguous region.
-  `--artwork` costs another ~1KB (the per-cell colour table) on top of that.
+  the packed song event budget is smaller than before: roughly 30 KB instead
+  of the old ~50 KB single contiguous region. `--artwork` costs another ~1KB
+  (the per-cell colour table) on top of that.
 - The first tempo event is honoured; mid-song tempo changes are planned.
 - PAL is the default. NTSC changes the SID clock and raster update point.
 - PSID export, keyboard effects and packed pattern data are planned

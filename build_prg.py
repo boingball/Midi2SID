@@ -16,22 +16,6 @@ EVENT_RETRIGGER_BASE = 0xf0
 MAX_END_ADDRESS = 0xcfff
 SCOPE_WIDTH = 12
 
-# $D000-$DFFF is VIC/SID/CIA I/O and can never hold data while the player
-# runs. But with LORAM=1,HIRAM=0,CHAREN=1 (the $01 CPU port value the player
-# already sets - see real_start) $E000-$FFFF is plain RAM, not KERNAL ROM,
-# and nothing here ever calls the KERNAL (interrupts stay off for the whole
-# program), so packed song events that overflow the $CFFF ceiling can spill
-# into it - a second, smaller region past the I/O hole - roughly doubling
-# how much a song can use over treating $0801-$CFFF as the only usable span.
-# The very top of it is reserved for the 6510 hardware vectors themselves
-# (see _player): a real RESTORE keypress fires NMI regardless of the I flag,
-# and if that vector pointed into arbitrary song data instead of a safe stub
-# the machine would jam, so a few bytes are set aside for that safety net
-# rather than counted as song budget.
-HIGH_RAM_START = 0xe000
-VECTOR_STUB_ADDRESS = 0xfff9
-HIGH_RAM_END = VECTOR_STUB_ADDRESS - 1
-
 # VIC-II hi-res bitmap layout. $2000 is forced: it is the only 8K-aligned
 # bitmap base inside bank 0 that doesn't collide with zero page/stack/this
 # program (the other choice, $0000, is where the program itself lives).
@@ -593,16 +577,6 @@ def _player(
     assembler.imm(0xa0, 0); assembler.byte(0xb1, zp_lo)
     assembler.zp(0xe6, zp_lo); assembler.branch(0xd0, "gotbyte")
     assembler.zp(0xe6, zp_hi)
-    # A page just crossed; if it's exactly the $D000 I/O hole, packed events
-    # continue at $E000 (see HIGH_RAM_START) rather than reading VIC/SID/CIA
-    # registers as if they were song data. A is the byte getpacked is about
-    # to return, so it must survive this check untouched (PHA/PLA) - it is
-    # not the byte this check inspects (zp_hi is).
-    assembler.byte(0x48)  # PHA
-    assembler.zp(0xa5, zp_hi); assembler.imm(0xc9, 0xd0); assembler.branch(0xd0, "no_redirect")
-    assembler.imm(0xa9, HIGH_RAM_START >> 8); assembler.zp(0x85, zp_hi)
-    assembler.label("no_redirect")
-    assembler.byte(0x68)  # PLA
     assembler.label("gotbyte"); assembler.byte(0x60)
 
     assembler.label("scan_keys")
@@ -810,32 +784,7 @@ def _player(
 
     assembler.label("events")
     event_address = assembler.pc
-    low_capacity = MAX_END_ADDRESS - assembler.pc + 1
-    if len(packed_events) <= low_capacity:
-        assembler.byte(*packed_events)
-    else:
-        high_chunk = packed_events[low_capacity:]
-        high_capacity = HIGH_RAM_END - HIGH_RAM_START + 1
-        if len(high_chunk) > high_capacity:
-            raise ValueError(
-                f"song is too large even with the ${HIGH_RAM_START:04x}-${HIGH_RAM_END:04x} "
-                f"extension ({len(packed_events)} packed event bytes; {low_capacity + high_capacity} "
-                "available). A pattern-bank backend is needed for this file."
-            )
-        assembler.byte(*packed_events[:low_capacity])
-        # $D000-$DFFF (I/O) can't hold data; pad the file up to $E000, where
-        # getpacked's page-cross check already expects the rest to continue.
-        assembler.byte(*([0] * (HIGH_RAM_START - assembler.pc)))
-        assembler.byte(*high_chunk)
-        assembler.byte(*([0] * (VECTOR_STUB_ADDRESS - assembler.pc)))
-        assembler.label("vector_stub")
-        # RTI: a real RESTORE keypress fires NMI no matter the I flag;
-        # without a safe landing spot for it, the vector would point into
-        # arbitrary song bytes and jam the machine.
-        assembler.byte(0x40)
-        assembler.word_label("vector_stub")             # NMI:   $FFFA/$FFFB
-        assembler.byte(ENTRY_ADDRESS & 0xff, ENTRY_ADDRESS >> 8)  # RESET: $FFFC/$FFFD
-        assembler.word_label("vector_stub")             # IRQ:   $FFFE/$FFFF (masked, never fires)
+    assembler.byte(*packed_events)
 
     code = bytearray(assembler.resolve())
     for offset, value in (
@@ -854,9 +803,13 @@ def build_prg(
         raise ValueError("video must be pal or ntsc")
     events = encode_events(frames)
     packed_events = pack_lzss(events)
-    # _player() raises ValueError itself if packed_events doesn't fit even
-    # with the $E000-$FFF8 high-RAM extension (see HIGH_RAM_START).
     payload = _basic_stub() + _player(title, packed_events, video, artwork=artwork)
+    end_address = LOAD_ADDRESS + len(payload) - 1
+    if end_address > MAX_END_ADDRESS:
+        raise ValueError(
+            f"song is too large for PRG v1 ({len(events)} raw / {len(packed_events)} packed event bytes; "
+            f"ends at ${end_address:04x}). A pattern-bank backend is needed for this file."
+        )
     result = Path(output)
     result.write_bytes(LOAD_ADDRESS.to_bytes(2, "little") + payload)
     return result
