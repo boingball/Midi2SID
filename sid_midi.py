@@ -536,6 +536,55 @@ def _drum_tail(pitch: int) -> int:
     return 2                                    # kick, snare, bells and other hits
 
 
+def channel_report(notes: list[Note]) -> list[dict]:
+    """Summarise each MIDI channel's contribution, to help pick what to cut
+    with --exclude-channels when a song is too large for PRG v1."""
+    channels: dict[int, list[Note]] = defaultdict(list)
+    for note in notes:
+        channels[note.channel].append(note)
+    song_end = max(note.end for note in notes)
+    rows = []
+    for channel in sorted(channels):
+        channel_notes = channels[channel]
+        programs = sorted({note.program for note in channel_notes})
+        families = sorted({family(program) for program in programs}) if channel != 9 else ["drums"]
+        rows.append({
+            "channel": channel + 1,
+            "notes": len(channel_notes),
+            "coverage": _coverage(channel_notes) / song_end,
+            "families": families,
+        })
+    return rows
+
+
+def _filter_channels(notes: list[Note], exclude_channels: set[int] | None) -> list[Note]:
+    if not exclude_channels:
+        return notes
+    filtered = [note for note in notes if note.channel not in exclude_channels]
+    if not filtered:
+        raise ValueError("--exclude-channels removed every note in the song")
+    return filtered
+
+
+def _trim_notes(
+    notes: list[Note], trim_seconds: float | None, division: int, tempos: list[tuple[int, int]],
+) -> list[Note]:
+    if trim_seconds is None:
+        return notes
+    tempo = _first_tempo(tempos)
+    cutoff_tick = int(trim_seconds * division * 1_000_000 / tempo)
+    trimmed = []
+    for note in notes:
+        if note.start >= cutoff_tick:
+            continue
+        end = min(note.end, cutoff_tick)
+        if end > note.start:
+            trimmed.append(Note(note.start, end, note.pitch, note.velocity, note.channel, note.program))
+    if not trimmed:
+        raise ValueError("--trim-seconds left no notes before the cutoff")
+    return trimmed
+
+
 def _first_tempo(tempos: list[tuple[int, int]]) -> int:
     at_zero = [value for tick, value in tempos if tick == 0]
     return at_zero[-1] if at_zero else (tempos[0][1] if tempos else 500_000)
@@ -670,8 +719,11 @@ def frames_for(
 def compile_sid_frames(
     midi_path: str | Path, video: str = "pal", drums: str = "smart",
     filter_mode: str = "off", feel: str = "tight",
+    exclude_channels: set[int] | None = None, trim_seconds: float | None = None,
 ) -> list[bytes]:
     division, notes, tempos = read_midi(midi_path)
+    notes = _filter_channels(notes, exclude_channels)
+    notes = _trim_notes(notes, trim_seconds, division, tempos)
     return frames_for(
         notes, division, tempos, drums=drums, video=video,
         filter_mode=filter_mode, feel=feel,

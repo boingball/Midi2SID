@@ -808,7 +808,9 @@ def build_prg(
     if end_address > MAX_END_ADDRESS:
         raise ValueError(
             f"song is too large for PRG v1 ({len(events)} raw / {len(packed_events)} packed event bytes; "
-            f"ends at ${end_address:04x}). A pattern-bank backend is needed for this file."
+            f"ends at ${end_address:04x}). Try --channel-report to see which MIDI channels take the "
+            f"most space, then --exclude-channels or --trim-seconds to shrink it. A pattern-bank "
+            f"backend is needed to lift this ceiling for good."
         )
     result = Path(output)
     result.write_bytes(LOAD_ADDRESS.to_bytes(2, "little") + payload)
