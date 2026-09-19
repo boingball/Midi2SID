@@ -50,6 +50,35 @@ class ArtworkConversionTests(unittest.TestCase):
             self.assertLess(nibble >> 4, 16)
             self.assertLess(nibble & 0xf, 16)
 
+    def test_cell_picks_one_flat_colour_for_a_gentle_gradient(self):
+        # Regression: always taking the mathematically best distinct pair
+        # (even when it wins by a hair) makes Floyd-Steinberg dither a cell
+        # that would look cleaner as one flat colour, turning a smooth
+        # gradient into speckle. A gentle in-cell gradient should collapse
+        # to a single repeated colour, not a distinct ink/paper pair.
+        pixels = [(100 + x, 120, 140) for x in range(8) for _ in range(8)]
+        ink, paper = artwork._cell_two_colours(pixels)
+        self.assertEqual(ink, paper)
+
+    def test_cell_picks_two_distinct_colours_for_a_hard_edge(self):
+        # A genuine hard edge (half the cell one colour, half another)
+        # should still get real two-colour treatment, not be flattened away.
+        pixels = [(20, 20, 20)] * 32 + [(230, 230, 230)] * 32
+        ink, paper = artwork._cell_two_colours(pixels)
+        self.assertNotEqual(ink, paper)
+
+    def test_gentle_gradient_image_does_not_speckle(self):
+        # End-to-end version of the same regression: a smooth gradient
+        # image should render as mostly flat (ink == paper) cells.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gradient.png"
+            _make_test_image(path, size=(320, 200))
+            _, screen = artwork.render_artwork(path)
+        flat_cells = sum(
+            1 for nibble in screen[:artwork.SCREEN_SIZE] if nibble >> 4 == nibble & 0xf
+        )
+        self.assertGreater(flat_cells, artwork.SCREEN_SIZE * 0.8)
+
     def test_odd_aspect_ratio_image_does_not_crash(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tall.png"
