@@ -33,7 +33,15 @@ python3 midi2sid.py song.mid song.prg --title "MY SONG" --drums smart --video pa
 python3 midi2sid.py song.mid song.prg --drums off --video ntsc
 python3 midi2sid.py song.mid song.prg --filter auto
 python3 midi2sid.py song.mid song.prg --feel expressive
+python3 midi2sid.py song.mid song.prg --artwork cover.jpg
+python3 midi2sid.py song.mid song.prg --channel-report
+python3 midi2sid.py song.mid song.prg --exclude-channels 10
+python3 midi2sid.py song.mid song.prg --trim-seconds 90
 ```
+
+`--artwork` needs [Pillow](https://python-pillow.org/) (`pip install Pillow`) to
+decode and resize the image; it is the only optional dependency and only
+needed if you use that flag.
 
 Load the resulting program in VICE, another C64 emulator, a flash cartridge,
 or real hardware, then type `RUN`. The program supplies its own BASIC launcher,
@@ -80,19 +88,54 @@ This is an automatic chip-music arrangement, not a transparent reproduction of
 the source MIDI. Dense chords must be reduced to three voices, and drums borrow
 voice three while they sound.
 
-## Current limits
+## Background artwork
 
-- The PRG v1 player combines register deltas with a streaming, 256-byte-window
-  LZSS decoder. Very long or modulation-heavy songs can still exceed `$D000`.
+`--artwork picture.jpg` (or `.png`) dithers an image to fill the whole
+320x200 bitmap behind the title, labels and scope, the same "full-screen
+picture with UI overlaid" idea as MIDI2AY's title card. VIC-II hi-res mode
+allows exactly two colours per 8x8 cell (the same constraint as the
+Spectrum's attribute clash), so each cell picks its own best two colours
+from the C64's 16-colour palette, then the whole image is Floyd-Steinberg
+dithered against those fixed per-cell palettes - the classic technique
+behind hand-digitised C64 "hires" photos. The image is cropped to fill the
+320x200 frame (not squashed). Label text and the oscilloscope rows always
+force their own cells back to a fixed, legible ink/paper colour after the
+artwork is drawn, so they stay readable regardless of what the picture put
+there.
+
+## Songs too large for PRG v1
+
+The PRG v1 player combines register deltas with a streaming, 256-byte-window
+LZSS decoder, which only catches repeats within that 256-byte lookback, not
+whole repeated bars or choruses further apart. Very long or busy songs (dense
+drum tracks especially) can still exceed the format's `$D000` budget and fail
+to build with a "song is too large" error.
+
+Three flags help right now:
+
+- `--channel-report` prints each MIDI channel's note count, how much of the
+  song it's active for, and its instrument family, without building anything.
+  Use it to see which channels are actually driving the size.
+- `--exclude-channels 3,10` drops the listed MIDI channels (1-16, so channel
+  10 is the standard GM drum channel) before conversion.
+- `--trim-seconds 90` keeps only the first N seconds of the song.
+
+Both can be combined, and used with `--drums off` too. A pattern-bank backend
+(reusing repeated bars, like an Amiga MOD's pattern table) is the planned fix
+that would lift the ceiling itself instead of asking you to cut material, but
+it needs a new packed-event format and player-side dispatcher, so it's a
+larger follow-up project rather than a quick patch.
+
+## Current limits
 - The oscilloscope bitmap reserves a fixed 8000-byte VIC-II bitmap at
   `$2000-$3F3F` (forced by hardware alignment), plus ~6.1KB for the four
   waveform-shape (triangle/saw/pulse/noise) picture sets right after it, so
   the packed song event budget is smaller than before: roughly 30 KB instead
-  of the old ~50 KB single contiguous region.
+  of the old ~50 KB single contiguous region. `--artwork` costs another ~1KB
+  (the per-cell colour table) on top of that.
 - The first tempo event is honoured; mid-song tempo changes are planned.
 - PAL is the default. NTSC changes the SID clock and raster update point.
-- Image conversion (JPG/PNG artwork behind the scope, like MIDI2AY's title
-  card), PSID export, keyboard effects and packed pattern data are planned
+- PSID export, keyboard effects and packed pattern data are planned
   follow-up features.
 
 ## Tests

@@ -253,6 +253,54 @@ class SidSynthesisTests(unittest.TestCase):
             _, notes, _ = sid_midi.read_midi(path)
         self.assertEqual({note.program for note in notes}, {0, 80})
 
+    def test_channel_report_summarises_notes_and_families(self):
+        notes = [
+            sid_midi.Note(0, 100, 60, 100, 0, 80),
+            sid_midi.Note(0, 50, 36, 90, 9, 0),
+        ]
+        rows = {row["channel"]: row for row in sid_midi.channel_report(notes)}
+        self.assertEqual(rows[1]["notes"], 1)
+        self.assertEqual(rows[1]["families"], ["lead"])
+        self.assertEqual(rows[10]["families"], ["drums"])
+
+    def test_exclude_channels_drops_only_those_channels(self):
+        notes = [
+            sid_midi.Note(0, 100, 60, 100, 0, 80),
+            sid_midi.Note(0, 100, 36, 90, 9, 0),
+        ]
+        kept = sid_midi._filter_channels(notes, {9})
+        self.assertEqual([note.channel for note in kept], [0])
+
+    def test_exclude_channels_rejecting_every_note_is_an_error(self):
+        notes = [sid_midi.Note(0, 100, 60, 100, 0, 80)]
+        with self.assertRaises(ValueError):
+            sid_midi._filter_channels(notes, {0})
+
+    def test_trim_seconds_clips_notes_at_the_cutoff(self):
+        division = 96
+        tempo = 500_000  # 120 BPM: one quarter note per 0.5s
+        notes = [
+            sid_midi.Note(0, division, 60, 100, 0, 0),
+            sid_midi.Note(division * 4, division * 5, 64, 100, 0, 0),
+        ]
+        trimmed = sid_midi._trim_notes(notes, 1.0, division, [(0, tempo)])
+        self.assertEqual(len(trimmed), 1)
+        self.assertEqual(trimmed[0].pitch, 60)
+
+    def test_compile_sid_frames_honours_exclude_and_trim(self):
+        header = b"MThd" + (6).to_bytes(4, "big") + b"\x00\x01\x00\x02\x00\x60"
+        lead = midi_track((b"\x00\x90\x3c\x64", b"\x81\x60\x80\x3c\x00"))
+        drums = midi_track((b"\x00\x99\x24\x64", b"\x60\x89\x24\x00"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "song.mid"
+            path.write_bytes(header + lead + drums)
+            full = sid_midi.compile_sid_frames(path)
+            without_drums = sid_midi.compile_sid_frames(path, exclude_channels={9})
+            trimmed = sid_midi.compile_sid_frames(path, trim_seconds=0.05)
+        self.assertGreater(len(full), len(trimmed))
+        self.assertTrue(any(frame[14:21] != bytes(7) for frame in full))
+        self.assertTrue(all(frame[14:21] == bytes(7) for frame in without_drums))
+
 
 class PrgTests(unittest.TestCase):
     def test_event_round_trip_preserves_frames(self):

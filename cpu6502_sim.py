@@ -14,7 +14,7 @@ from __future__ import annotations
 
 
 class CPU:
-    def __init__(self, mem: bytearray | None = None):
+    def __init__(self, mem: bytearray | None = None, char_rom: bytes | None = None):
         self.mem = mem if mem is not None else bytearray(65536)
         self.a = self.x = self.y = 0
         self.sp = 0xff
@@ -22,15 +22,30 @@ class CPU:
         self.c = self.z = self.n = self.v = 0
         self.steps = 0
         self.io_hook = None  # optional callable(addr, value) for writes
+        # $D000-$DFFF is either I/O or character ROM depending on the CPU
+        # port ($01) CHAREN bit, matching real hardware: a write there
+        # always lands in the shadow RAM (self.mem, exactly like any other
+        # write), but a *read* while CHAREN is low must come from character
+        # ROM, not whatever shadow RAM holds - conflating the two let a
+        # write meant for the VIC/SID registers silently "corrupt" character
+        # ROM in this simulator, something that cannot happen on real
+        # hardware (ROM is physically read-only).
+        self.char_rom = char_rom
+        self.charen = True  # I/O visible; matches the KERNAL's boot default
 
     # -- memory helpers ---------------------------------------------------
     def rd(self, addr: int) -> int:
-        return self.mem[addr & 0xffff]
+        addr &= 0xffff
+        if not self.charen and self.char_rom is not None and 0xd000 <= addr <= 0xdfff:
+            return self.char_rom[addr - 0xd000]
+        return self.mem[addr]
 
     def wr(self, addr: int, value: int) -> None:
         addr &= 0xffff
         value &= 0xff
         self.mem[addr] = value
+        if addr == 0x01:
+            self.charen = bool(value & 0x04)
         if self.io_hook is not None:
             self.io_hook(addr, value)
 
@@ -97,11 +112,13 @@ class CPU:
     def run(self, start: int, max_steps: int = 2_000_000, stop_at: set[int] | None = None) -> None:
         self.pc = start
         stop_at = stop_at or set()
-        while self.steps < max_steps:
+        executed = 0
+        while executed < max_steps:
             if self.pc in stop_at:
                 return
             self.step()
-            if self.steps >= max_steps:
+            executed += 1
+            if executed >= max_steps:
                 raise RuntimeError(f"6502 sim exceeded {max_steps} steps (runaway loop?) at pc=${self.pc:04x}")
 
     def step(self) -> None:
