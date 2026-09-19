@@ -160,6 +160,34 @@ class BitmapDisplayTests(unittest.TestCase):
         for trace in traces:
             self.assertTrue(any(trace))
 
+    def test_pulse_voices_differ_by_their_own_live_pulse_width(self):
+        # Over half the GM patch table maps to PULSE, so without reading
+        # each voice's own pulse-width register they'd all draw the exact
+        # same picture and only the phase nudge would tell them apart -
+        # easy to miss on a real song. A narrow-duty bass patch and a
+        # near-square lead patch must render visibly different traces even
+        # with the same control byte, frequency and phase.
+        code, labels = _assemble_with_labels()
+        mem, _ = _boot_memory(code)
+
+        def render(pulse_width_hi):
+            mem[0xd404] = sid_midi.PULSE | 1  # voice 1 gated on, PULSE
+            mem[0xd401] = 0x20                # frequency-hi
+            mem[0xd403] = pulse_width_hi      # voice 1's own pulse-width-hi
+            mem[0xee] = 0                     # zp_phase1
+            mem[0xf3] = 0                     # zp_frame: force phase recompute
+            cpu = CPU(mem)
+            return_to = 0x9000
+            cpu.push((return_to - 1) >> 8)
+            cpu.push((return_to - 1) & 0xff)
+            cpu.run(labels["draw_scopes"], max_steps=200_000, stop_at={return_to})
+            dest = build_prg.cell_addr(6, 2)
+            return bytes(mem[dest:dest + build_prg.SCOPE_TRACE_BYTES])
+
+        narrow_trace = render(0x00)
+        wide_trace = render(0x0f)
+        self.assertNotEqual(narrow_trace, wide_trace)
+
     def test_higher_pitched_voice_advances_its_phase_faster(self):
         # A shift of >>6 on an 8-bit frequency-hi byte left almost every
         # musically useful note with the same nudge, so all three scope

@@ -48,9 +48,17 @@ def _wave_row_saw(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASE
     return round(offset / period * 7)
 
 
-def _wave_row_pulse(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
+def _wave_row_pulse(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES, duty: float = 0.5) -> int:
     offset = (x + phase * (period // phases)) % period
-    return 1 if offset < period // 2 else 6
+    return 1 if offset < period * duty else 6
+
+
+def _wave_row_pulse_narrow(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
+    return _wave_row_pulse(x, phase, period, phases, duty=0.25)
+
+
+def _wave_row_pulse_wide(x: int, phase: int, period: int = 48, phases: int = WAVE_PHASES) -> int:
+    return _wave_row_pulse(x, phase, period, phases, duty=0.75)
 
 
 def _wave_row_noise(x: int, phase: int, **_ignored) -> int:
@@ -67,18 +75,33 @@ def _wave_row_noise(x: int, phase: int, **_ignored) -> int:
 # the scope shows what each voice is actually synthesising (a bright square
 # wave for a pulse patch, a smooth ramp for a triangle lead, a jagged trace
 # for a noise drum hit) instead of one generic wiggle for every voice.
+#
+# Well over half the GM patch table (piano, organ, bass, ensemble, reed,
+# pipe, lead, pad) uses PULSE, so without more than one pulse shape those
+# voices all draw the exact same picture and only the phase nudge tells
+# them apart - easy to miss on a real song. The two PULSE entries share a
+# control-register bit; draw_scopes picks narrow vs wide at runtime from
+# each voice's own live pulse-width register (see PULSE_NIBBLE below), so a
+# narrow bass pulse actually looks different from a near-square lead pulse.
 WAVEFORMS = (
-    (0x10, _wave_row_triangle),  # TRIANGLE
-    (0x20, _wave_row_saw),       # SAWTOOTH
-    (0x40, _wave_row_pulse),     # PULSE
-    (0x80, _wave_row_noise),     # NOISE
+    (0x10, _wave_row_triangle),      # TRIANGLE
+    (0x20, _wave_row_saw),           # SAWTOOTH
+    (0x40, _wave_row_pulse_narrow),  # PULSE, narrow duty (PWHI nibble < 8)
+    (0x40, _wave_row_pulse_wide),    # PULSE, wide duty (PWHI nibble >= 8)
+    (0x80, _wave_row_noise),         # NOISE
 )
-# Maps (control >> 4), i.e. the waveform nibble, to an index into WAVEFORMS.
-# Only single-bit waveforms are given a real shape (every MIDI2SID patch
-# uses exactly one); an unset or combined nibble falls back to triangle.
+PULSE_NIBBLE = 0x40 >> 4
+# Maps (control >> 4), i.e. the waveform nibble, to a WAVEFORMS index - the
+# first (narrow) entry for a nibble shared by two entries, since the second
+# is only ever reached dynamically at runtime. An unset or combined nibble
+# falls back to triangle.
 WAVE_INDEX_FOR_NIBBLE = [0] * 16
+_nibbles_assigned: set[int] = set()
 for _wf_index, (_bit, _fn) in enumerate(WAVEFORMS):
-    WAVE_INDEX_FOR_NIBBLE[_bit >> 4] = _wf_index
+    _nibble = _bit >> 4
+    if _nibble not in _nibbles_assigned:
+        WAVE_INDEX_FOR_NIBBLE[_nibble] = _wf_index
+        _nibbles_assigned.add(_nibble)
 
 
 def _wave_phase_bytes(row_fn, phase: int) -> bytes:
@@ -637,6 +660,20 @@ def _player(
         for _ in range(5):
             assembler.byte(0x0a)                  # ASL A (index -> index*32)
         assembler.zp(0x85, zp_tmp)
+        # Y still holds the waveform nibble (TAY above; nothing since has
+        # touched Y). Only a PULSE voice has a second, wider-duty picture
+        # sitting right after the narrow one in wave_ptr_table, reached by
+        # bumping zp_tmp one wave-block (32 bytes) when the voice's own
+        # live pulse-width-hi register says its duty is >= 50%.
+        assembler.imm(0xc0, PULSE_NIBBLE)          # CPY #PULSE_NIBBLE
+        assembler.branch(0xd0, f"scope_narrow_{index}")
+        assembler.absolute(0xad, frequency_hi + 2)  # LDA pulse-width-hi
+        assembler.imm(0x29, 0x0f)
+        assembler.imm(0xc9, 8)
+        assembler.branch(0x90, f"scope_narrow_{index}")
+        assembler.zp(0xa5, zp_tmp); assembler.byte(0x18)
+        assembler.imm(0x69, WAVE_PHASES * 2); assembler.zp(0x85, zp_tmp)
+        assembler.label(f"scope_narrow_{index}")
         assembler.zp(0xa5, phase)
         assembler.byte(0x0a)                      # ASL A (phase -> phase*2)
         assembler.byte(0x18)                      # CLC
