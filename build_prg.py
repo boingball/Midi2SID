@@ -616,7 +616,12 @@ def _player(
         assembler.zp(0xa5, zp_frame); assembler.imm(0x29, 3)
         assembler.branch(0xd0, f"scope_render_{index}")
         assembler.absolute(0xad, frequency_hi)
-        for _ in range(6):
+        # >>3 (not >>6): shifting away 6 bits of an 8-bit frequency-hi byte
+        # left almost every musically useful note with the same nudge (0),
+        # so all three voices advanced in lockstep regardless of pitch. >>3
+        # spreads the nudge across roughly 0-13 for the normal note range,
+        # so a higher voice visibly animates faster than a lower one.
+        for _ in range(3):
             assembler.byte(0x4a)                  # LSR A
         assembler.byte(0x18); assembler.imm(0x69, 1)
         assembler.zp(0x65, phase); assembler.imm(0x29, 0x0f)

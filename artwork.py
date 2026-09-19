@@ -38,40 +38,50 @@ def cell_index(row: int, col: int) -> int:
     return row * CELL_COLS + col
 
 
-def _nearest_palette_index(rgb: tuple[float, float, float]) -> int:
-    best_index, best_distance = 0, None
-    for index, colour in enumerate(C64_PALETTE):
-        distance = sum((a - b) ** 2 for a, b in zip(rgb, colour))
-        if best_distance is None or distance < best_distance:
-            best_index, best_distance = index, distance
-    return best_index
+TWO_COLOUR_GAIN_THRESHOLD = 0.20
 
 
 def _cell_two_colours(pixels: list[tuple[int, int, int]]) -> tuple[int, int]:
-    """Pick two C64 palette indices representing this cell's pixels.
+    """Pick the two C64 palette entries that best represent this cell.
 
-    A quick 2-means split on raw RGB (seeded from the darkest/lightest
-    pixel) separates a cell's content into two clusters better than a single
-    luminance threshold would for coloured, not just light/dark, subjects;
-    a couple of iterations is enough since this only has to pick a fixed
-    per-cell palette, not classify precisely.
+    A continuous 2-means split followed by snapping each cluster's average
+    colour to the nearest palette entry can land on a poor pair: an average
+    computed in RGB space isn't guaranteed to sit near a good real palette
+    colour. 16 colours is small enough (120 distinct pairs) to instead
+    brute-force the exact best single colour and the exact best distinct
+    pair - whichever minimises the summed squared error against every pixel
+    in the cell, each pixel measured against its closer colour of the pair.
+
+    Always taking the best distinct pair sounds strictly better, but it
+    isn't: Floyd-Steinberg only dithers a cell when its ink and paper
+    differ, so handing every near-flat cell (a gradient sky, a plain
+    background) two genuinely different colours - even when they win by a
+    tiny margin - makes it dither too, turning a clean flat area into
+    speckle. Real detail (a hard edge, a facial feature) needs the second
+    colour; a gentle gradient does not. Requiring the pair to cut error by
+    TWO_COLOUR_GAIN_THRESHOLD keeps two colours for the former and one flat
+    colour for the latter.
     """
     if not pixels:
         return 0, 0
-    darkest = min(pixels, key=sum)
-    lightest = max(pixels, key=sum)
-    seed_a, seed_b = darkest, lightest
-    for _ in range(3):
-        cluster_a, cluster_b = [], []
-        for pixel in pixels:
-            distance_a = sum((a - b) ** 2 for a, b in zip(pixel, seed_a))
-            distance_b = sum((a - b) ** 2 for a, b in zip(pixel, seed_b))
-            (cluster_a if distance_a <= distance_b else cluster_b).append(pixel)
-        if cluster_a:
-            seed_a = tuple(sum(channel) / len(cluster_a) for channel in zip(*cluster_a))
-        if cluster_b:
-            seed_b = tuple(sum(channel) / len(cluster_b) for channel in zip(*cluster_b))
-    return _nearest_palette_index(seed_a), _nearest_palette_index(seed_b)
+    distances_by_colour = [
+        [sum((p - c) ** 2 for p, c in zip(pixel, colour)) for pixel in pixels]
+        for colour in C64_PALETTE
+    ]
+    best_single, best_single_error = 0, None
+    for i, distances in enumerate(distances_by_colour):
+        error = sum(distances)
+        if best_single_error is None or error < best_single_error:
+            best_single, best_single_error = i, error
+    best_pair, best_pair_error = (best_single, best_single), best_single_error
+    for i in range(len(C64_PALETTE)):
+        for j in range(i + 1, len(C64_PALETTE)):
+            error = sum(map(min, distances_by_colour[i], distances_by_colour[j]))
+            if error < best_pair_error:
+                best_pair, best_pair_error = (i, j), error
+    if best_single_error == 0 or best_pair_error >= best_single_error * (1 - TWO_COLOUR_GAIN_THRESHOLD):
+        return best_single, best_single
+    return best_pair
 
 
 def _cover_resize(image, width: int, height: int):

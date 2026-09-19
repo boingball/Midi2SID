@@ -103,6 +103,21 @@ force their own cells back to a fixed, legible ink/paper colour after the
 artwork is drawn, so they stay readable regardless of what the picture put
 there.
 
+A cell only gets two distinct colours when that meaningfully beats one flat
+colour; a gentle gradient (sky, a plain backdrop) stays flat instead of
+picking two very-similar colours that would make Floyd-Steinberg dither it
+into visible speckle for no real gain. Real detail - a hard edge, a facial
+feature - still gets genuine two-colour treatment. Photographic detail finer
+than one hardware colour per 8x8 block is still lossy by nature (the same
+"clash" look real digitised C64 photos have), especially on faces.
+
+To check how a picture will actually look before building a PRG and loading
+it in VICE:
+
+```sh
+python3 preview_artwork.py cover.jpg preview.png
+```
+
 ## Songs too large for PRG v1
 
 The PRG v1 player combines register deltas with a streaming, 256-byte-window
